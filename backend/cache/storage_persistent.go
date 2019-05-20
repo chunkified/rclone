@@ -3,20 +3,17 @@
 package cache
 
 import (
-	"time"
-
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"io/ioutil"
 	"os"
 	"path"
 	"strconv"
 	"strings"
 	"sync"
-
-	"io/ioutil"
-
-	"fmt"
+	"time"
 
 	bolt "github.com/coreos/bbolt"
 	"github.com/ncw/rclone/fs"
@@ -34,7 +31,8 @@ const (
 
 // Features flags for this storage type
 type Features struct {
-	PurgeDb bool // purge the db before starting
+	PurgeDb    bool          // purge the db before starting
+	DbWaitTime time.Duration // time to wait for DB to be available
 }
 
 var boltMap = make(map[string]*Persistent)
@@ -122,7 +120,7 @@ func (b *Persistent) connect() error {
 	if err != nil {
 		return errors.Wrapf(err, "failed to create a data directory %q", b.dataPath)
 	}
-	b.db, err = bolt.Open(b.dbPath, 0644, &bolt.Options{Timeout: *cacheDbWaitTime})
+	b.db, err = bolt.Open(b.dbPath, 0644, &bolt.Options{Timeout: b.features.DbWaitTime})
 	if err != nil {
 		return errors.Wrapf(err, "failed to open a cache connection to %q", b.dbPath)
 	}
@@ -342,7 +340,7 @@ func (b *Persistent) RemoveDir(fp string) error {
 // ExpireDir will flush a CachedDirectory and all its objects from the objects
 // chunks will remain as they are
 func (b *Persistent) ExpireDir(cd *Directory) error {
-	t := time.Now().Add(cd.CacheFs.fileAge * -1)
+	t := time.Now().Add(time.Duration(-cd.CacheFs.opt.InfoAge))
 	cd.CacheTs = &t
 
 	// expire all parents
@@ -400,7 +398,7 @@ func (b *Persistent) AddObject(cachedObject *Object) error {
 		if err != nil {
 			return errors.Errorf("couldn't marshal object (%v) info: %v", cachedObject, err)
 		}
-		err = bucket.Put([]byte(cachedObject.Name), []byte(encoded))
+		err = bucket.Put([]byte(cachedObject.Name), encoded)
 		if err != nil {
 			return errors.Errorf("couldn't cache object (%v) info: %v", cachedObject, err)
 		}
@@ -429,7 +427,7 @@ func (b *Persistent) RemoveObject(fp string) error {
 
 // ExpireObject will flush an Object and all its data if desired
 func (b *Persistent) ExpireObject(co *Object, withData bool) error {
-	co.CacheTs = time.Now().Add(co.CacheFs.fileAge * -1)
+	co.CacheTs = time.Now().Add(time.Duration(-co.CacheFs.opt.InfoAge))
 	err := b.AddObject(co)
 	if withData {
 		_ = os.RemoveAll(path.Join(b.dataPath, co.abs()))
@@ -811,7 +809,7 @@ func (b *Persistent) addPendingUpload(destPath string, started bool) error {
 		if err != nil {
 			return errors.Errorf("couldn't marshal object (%v) info: %v", destPath, err)
 		}
-		err = bucket.Put([]byte(destPath), []byte(encoded))
+		err = bucket.Put([]byte(destPath), encoded)
 		if err != nil {
 			return errors.Errorf("couldn't cache object (%v) info: %v", destPath, err)
 		}
@@ -1025,7 +1023,7 @@ func (b *Persistent) ReconcileTempUploads(cacheFs *Fs) error {
 		}
 
 		var queuedEntries []fs.Object
-		err = walk.Walk(cacheFs.tempFs, "", true, -1, func(path string, entries fs.DirEntries, err error) error {
+		err = walk.ListR(cacheFs.tempFs, "", true, -1, walk.ListObjects, func(entries fs.DirEntries) error {
 			for _, o := range entries {
 				if oo, ok := o.(fs.Object); ok {
 					queuedEntries = append(queuedEntries, oo)
@@ -1051,7 +1049,7 @@ func (b *Persistent) ReconcileTempUploads(cacheFs *Fs) error {
 			if err != nil {
 				return errors.Errorf("couldn't marshal object (%v) info: %v", queuedEntry, err)
 			}
-			err = bucket.Put([]byte(destPath), []byte(encoded))
+			err = bucket.Put([]byte(destPath), encoded)
 			if err != nil {
 				return errors.Errorf("couldn't cache object (%v) info: %v", destPath, err)
 			}

@@ -53,7 +53,6 @@ func mountOptions(device string, mountpoint string) (options []string) {
 
 	// OSX options
 	if runtime.GOOS == "darwin" {
-		options = append(options, "-o", "volname="+mountlib.VolumeName)
 		if mountlib.NoAppleDouble {
 			options = append(options, "-o", "noappledouble")
 		}
@@ -70,6 +69,11 @@ func mountOptions(device string, mountpoint string) (options []string) {
 		options = append(options, "--FileSystemName=rclone")
 	}
 
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		if mountlib.VolumeName != "" {
+			options = append(options, "-o", "volname="+mountlib.VolumeName)
+		}
+	}
 	if mountlib.AllowNonEmpty {
 		options = append(options, "-o", "nonempty")
 	}
@@ -87,6 +91,9 @@ func mountOptions(device string, mountpoint string) (options []string) {
 	}
 	if mountlib.WritebackCache {
 		// FIXME? options = append(options, "-o", WritebackCache())
+	}
+	if mountlib.DaemonTimeout != 0 {
+		options = append(options, "-o", fmt.Sprintf("daemon_timeout=%d", int(mountlib.DaemonTimeout.Seconds())))
 	}
 	for _, option := range mountlib.ExtraOptions {
 		options = append(options, "-o", option)
@@ -120,7 +127,7 @@ func waitFor(fn func() bool) (ok bool) {
 func mount(f fs.Fs, mountpoint string) (*vfs.VFS, <-chan error, func() error, error) {
 	fs.Debugf(f, "Mounting on %q", mountpoint)
 
-	// Check the mountpoint - in Windows the mountpoint musn't exist before the mount
+	// Check the mountpoint - in Windows the mountpoint mustn't exist before the mount
 	if runtime.GOOS != "windows" {
 		fi, err := os.Stat(mountpoint)
 		if err != nil {
@@ -210,7 +217,7 @@ func Mount(f fs.Fs, mountpoint string) error {
 	sigHup := make(chan os.Signal, 1)
 	signal.Notify(sigHup, syscall.SIGHUP)
 
-	if err := sdnotify.SdNotifyReady(); err != nil && err != sdnotify.SdNotifyNoSocket {
+	if err := sdnotify.Ready(); err != nil && err != sdnotify.ErrSdNotifyNoSocket {
 		return errors.Wrap(err, "failed to notify systemd")
 	}
 
@@ -231,7 +238,7 @@ waitloop:
 		}
 	}
 
-	_ = sdnotify.SdNotifyStopping()
+	_ = sdnotify.Stopping()
 	if err != nil {
 		return errors.Wrap(err, "failed to umount FUSE fs")
 	}

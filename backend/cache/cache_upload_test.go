@@ -3,14 +3,13 @@
 package cache_test
 
 import (
+	"fmt"
 	"math/rand"
 	"os"
 	"path"
 	"strconv"
 	"testing"
 	"time"
-
-	"fmt"
 
 	"github.com/ncw/rclone/backend/cache"
 	_ "github.com/ncw/rclone/backend/drive"
@@ -22,7 +21,7 @@ func TestInternalUploadTempDirCreated(t *testing.T) {
 	id := fmt.Sprintf("tiutdc%v", time.Now().Unix())
 	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, false, true,
 		nil,
-		map[string]string{"cache-tmp-upload-path": path.Join(runInstance.tmpUploadDir, id)})
+		map[string]string{"tmp_upload_path": path.Join(runInstance.tmpUploadDir, id)})
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
 	_, err := os.Stat(path.Join(runInstance.tmpUploadDir, id))
@@ -63,7 +62,7 @@ func TestInternalUploadQueueOneFileNoRest(t *testing.T) {
 	id := fmt.Sprintf("tiuqofnr%v", time.Now().Unix())
 	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, true, true,
 		nil,
-		map[string]string{"cache-tmp-upload-path": path.Join(runInstance.tmpUploadDir, id), "cache-tmp-wait-time": "0s"})
+		map[string]string{"tmp_upload_path": path.Join(runInstance.tmpUploadDir, id), "tmp_wait_time": "0s"})
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
 	testInternalUploadQueueOneFile(t, id, rootFs, boltDb)
@@ -73,7 +72,7 @@ func TestInternalUploadQueueOneFileWithRest(t *testing.T) {
 	id := fmt.Sprintf("tiuqofwr%v", time.Now().Unix())
 	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, true, true,
 		nil,
-		map[string]string{"cache-tmp-upload-path": path.Join(runInstance.tmpUploadDir, id), "cache-tmp-wait-time": "1m"})
+		map[string]string{"tmp_upload_path": path.Join(runInstance.tmpUploadDir, id), "tmp_wait_time": "1m"})
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
 	testInternalUploadQueueOneFile(t, id, rootFs, boltDb)
@@ -83,7 +82,7 @@ func TestInternalUploadMoveExistingFile(t *testing.T) {
 	id := fmt.Sprintf("tiumef%v", time.Now().Unix())
 	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, true, true,
 		nil,
-		map[string]string{"cache-tmp-upload-path": path.Join(runInstance.tmpUploadDir, id), "cache-tmp-wait-time": "3s"})
+		map[string]string{"tmp_upload_path": path.Join(runInstance.tmpUploadDir, id), "tmp_wait_time": "3s"})
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
 	err := rootFs.Mkdir("one")
@@ -163,7 +162,7 @@ func TestInternalUploadQueueMoreFiles(t *testing.T) {
 	id := fmt.Sprintf("tiuqmf%v", time.Now().Unix())
 	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, true, true,
 		nil,
-		map[string]string{"cache-tmp-upload-path": path.Join(runInstance.tmpUploadDir, id), "cache-tmp-wait-time": "1s"})
+		map[string]string{"tmp_upload_path": path.Join(runInstance.tmpUploadDir, id), "tmp_wait_time": "1s"})
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
 	err := rootFs.Mkdir("test")
@@ -213,7 +212,7 @@ func TestInternalUploadTempFileOperations(t *testing.T) {
 	id := "tiutfo"
 	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, true, true,
 		nil,
-		map[string]string{"cache-tmp-upload-path": path.Join(runInstance.tmpUploadDir, id), "cache-tmp-wait-time": "1h"})
+		map[string]string{"tmp_upload_path": path.Join(runInstance.tmpUploadDir, id), "tmp_wait_time": "1h"})
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
 	boltDb.PurgeTempUploads()
@@ -343,7 +342,7 @@ func TestInternalUploadUploadingFileOperations(t *testing.T) {
 	id := "tiuufo"
 	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, true, true,
 		nil,
-		map[string]string{"cache-tmp-upload-path": path.Join(runInstance.tmpUploadDir, id), "cache-tmp-wait-time": "1h"})
+		map[string]string{"tmp_upload_path": path.Join(runInstance.tmpUploadDir, id), "tmp_wait_time": "1h"})
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
 	boltDb.PurgeTempUploads()

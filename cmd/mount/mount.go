@@ -5,6 +5,7 @@
 package mount
 
 import (
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -62,6 +63,9 @@ func mountOptions(device string) (options []fuse.MountOption) {
 	}
 	if mountlib.WritebackCache {
 		options = append(options, fuse.WritebackCache())
+	}
+	if mountlib.DaemonTimeout != 0 {
+		options = append(options, fuse.DaemonTimeout(fmt.Sprint(int(mountlib.DaemonTimeout.Seconds()))))
 	}
 	if len(mountlib.ExtraOptions) > 0 {
 		fs.Errorf(nil, "-o/--option not supported with this FUSE backend")
@@ -136,7 +140,7 @@ func Mount(f fs.Fs, mountpoint string) error {
 	signal.Notify(sigHup, syscall.SIGHUP)
 	atexit.IgnoreSignals()
 
-	if err := sdnotify.SdNotifyReady(); err != nil && err != sdnotify.SdNotifyNoSocket {
+	if err := sdnotify.Ready(); err != nil && err != sdnotify.ErrSdNotifyNoSocket {
 		return errors.Wrap(err, "failed to notify systemd")
 	}
 
@@ -161,7 +165,7 @@ waitloop:
 		}
 	}
 
-	_ = sdnotify.SdNotifyStopping()
+	_ = sdnotify.Stopping()
 	if err != nil {
 		return errors.Wrap(err, "failed to umount FUSE fs")
 	}

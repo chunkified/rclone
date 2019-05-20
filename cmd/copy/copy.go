@@ -7,8 +7,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var (
+	createEmptySrcDirs = false
+)
+
 func init() {
 	cmd.Root.AddCommand(commandDefintion)
+	commandDefintion.Flags().BoolVarP(&createEmptySrcDirs, "create-empty-src-dirs", "", createEmptySrcDirs, "Create empty source dirs on destination after copy")
 }
 
 var commandDefintion = &cobra.Command{
@@ -50,13 +55,26 @@ If you are familiar with ` + "`rsync`" + `, rclone always works as if you had
 written a trailing / - meaning "copy the contents of this directory".
 This applies to all commands and whether you are talking about the
 source or destination.
+
+See the [--no-traverse](/docs/#no-traverse) option for controlling
+whether rclone lists the destination directory or not.  Supplying this
+option when copying a small number of files into a large destination
+can speed transfers up greatly.
+
+For example, if you have many files in /path/to/src but only a few of
+them change every day, you can to copy all the files which have
+changed recently very efficiently like this:
+
+    rclone copy --max-age 24h --no-traverse /path/to/src remote:
+
+**Note**: Use the ` + "`-P`" + `/` + "`--progress`" + ` flag to view real-time transfer statistics
 `,
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(2, 2, command, args)
 		fsrc, srcFileName, fdst := cmd.NewFsSrcFileDst(args)
 		cmd.Run(true, true, command, func() error {
 			if srcFileName == "" {
-				return sync.CopyDir(fdst, fsrc)
+				return sync.CopyDir(fdst, fsrc, createEmptySrcDirs)
 			}
 			return operations.CopyFile(fdst, fsrc, srcFileName, srcFileName)
 		})

@@ -23,7 +23,8 @@ import (
 	"github.com/ncw/rclone/backend/box/api"
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/config"
-	"github.com/ncw/rclone/fs/config/flags"
+	"github.com/ncw/rclone/fs/config/configmap"
+	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/config/obscure"
 	"github.com/ncw/rclone/fs/fserrors"
 	"github.com/ncw/rclone/fs/hash"
@@ -46,6 +47,7 @@ const (
 	uploadURL                   = "https://upload.box.com/api/2.0"
 	listChunks                  = 1000     // chunk size to read directory listings
 	minUploadCutoff             = 50000000 // upload cutoff can be no lower than this
+	defaultUploadCutoff         = 50 * 1024 * 1024
 )
 
 // Globals
@@ -61,7 +63,6 @@ var (
 		ClientSecret: obscure.MustReveal(rcloneEncryptedClientSecret),
 		RedirectURL:  oauthutil.RedirectURL,
 	}
-	uploadCutoff = fs.SizeSuffix(50 * 1024 * 1024)
 )
 
 // Register with Fs
@@ -70,31 +71,47 @@ func init() {
 		Name:        "box",
 		Description: "Box",
 		NewFs:       NewFs,
-		Config: func(name string) {
-			err := oauthutil.Config("box", name, oauthConfig)
+		Config: func(name string, m configmap.Mapper) {
+			err := oauthutil.Config("box", name, m, oauthConfig)
 			if err != nil {
 				log.Fatalf("Failed to configure token: %v", err)
 			}
 		},
 		Options: []fs.Option{{
 			Name: config.ConfigClientID,
-			Help: "Box App Client Id - leave blank normally.",
+			Help: "Box App Client Id.\nLeave blank normally.",
 		}, {
 			Name: config.ConfigClientSecret,
-			Help: "Box App Client Secret - leave blank normally.",
+			Help: "Box App Client Secret\nLeave blank normally.",
+		}, {
+			Name:     "upload_cutoff",
+			Help:     "Cutoff for switching to multipart upload (>= 50MB).",
+			Default:  fs.SizeSuffix(defaultUploadCutoff),
+			Advanced: true,
+		}, {
+			Name:     "commit_retries",
+			Help:     "Max number of times to try committing a multipart file.",
+			Default:  100,
+			Advanced: true,
 		}},
 	})
-	flags.VarP(&uploadCutoff, "box-upload-cutoff", "", "Cutoff for switching to multipart upload")
+}
+
+// Options defines the configuration for this backend
+type Options struct {
+	UploadCutoff  fs.SizeSuffix `config:"upload_cutoff"`
+	CommitRetries int           `config:"commit_retries"`
 }
 
 // Fs represents a remote box
 type Fs struct {
 	name         string                // name of this remote
 	root         string                // the path we are working on
+	opt          Options               // parsed options
 	features     *fs.Features          // optional features
 	srv          *rest.Client          // the connection to the one drive server
 	dirCache     *dircache.DirCache    // Map of directory path to directory id
-	pacer        *pacer.Pacer          // pacer for API calls
+	pacer        *fs.Pacer             // pacer for API calls
 	tokenRenewer *oauthutil.Renew      // renew the token on expiry
 	uploadToken  *pacer.TokenDispenser // control concurrency
 }
@@ -109,6 +126,7 @@ type Object struct {
 	size        int64     // size of the object
 	modTime     time.Time // modification time of the object
 	id          string    // ID of the object
+	publicLink  string    // Public Link for the object
 	sha1        string    // SHA-1 of the object content
 }
 
@@ -153,13 +171,13 @@ var retryErrorCodes = []int{
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
 func shouldRetry(resp *http.Response, err error) (bool, error) {
-	authRety := false
+	authRetry := false
 
 	if resp != nil && resp.StatusCode == 401 && len(resp.Header["Www-Authenticate"]) == 1 && strings.Index(resp.Header["Www-Authenticate"][0], "expired_token") >= 0 {
-		authRety = true
+		authRetry = true
 		fs.Debugf(nil, "Should retry: %v", err)
 	}
-	return authRety || fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
+	return authRetry || fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
 // substitute reserved characters for box
@@ -219,22 +237,30 @@ func errorHandler(resp *http.Response) error {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string) (fs.Fs, error) {
-	if uploadCutoff < minUploadCutoff {
-		return nil, errors.Errorf("box: upload cutoff (%v) must be greater than equal to %v", uploadCutoff, fs.SizeSuffix(minUploadCutoff))
+func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
+	}
+
+	if opt.UploadCutoff < minUploadCutoff {
+		return nil, errors.Errorf("box: upload cutoff (%v) must be greater than equal to %v", opt.UploadCutoff, fs.SizeSuffix(minUploadCutoff))
 	}
 
 	root = parsePath(root)
-	oAuthClient, ts, err := oauthutil.NewClient(name, oauthConfig)
+	oAuthClient, ts, err := oauthutil.NewClient(name, m, oauthConfig)
 	if err != nil {
-		log.Fatalf("Failed to configure Box: %v", err)
+		return nil, errors.Wrap(err, "failed to configure Box")
 	}
 
 	f := &Fs{
 		name:        name,
 		root:        root,
+		opt:         *opt,
 		srv:         rest.NewClient(oAuthClient).SetRoot(rootURL),
-		pacer:       pacer.New().SetMinSleep(minSleep).SetMaxSleep(maxSleep).SetDecayConstant(decayConstant),
+		pacer:       fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		uploadToken: pacer.NewTokenDispenser(fs.Config.Transfers),
 	}
 	f.features = (&fs.Features{
@@ -257,16 +283,16 @@ func NewFs(name, root string) (fs.Fs, error) {
 	if err != nil {
 		// Assume it is a file
 		newRoot, remote := dircache.SplitPath(root)
-		newF := *f
-		newF.dirCache = dircache.New(newRoot, rootID, &newF)
-		newF.root = newRoot
+		tempF := *f
+		tempF.dirCache = dircache.New(newRoot, rootID, &tempF)
+		tempF.root = newRoot
 		// Make new Fs which is the parent
-		err = newF.dirCache.FindRoot(false)
+		err = tempF.dirCache.FindRoot(false)
 		if err != nil {
 			// No root so return old f
 			return f, nil
 		}
-		_, err := newF.newObjectWithInfo(remote, nil)
+		_, err := tempF.newObjectWithInfo(remote, nil)
 		if err != nil {
 			if err == fs.ErrorObjectNotFound {
 				// File doesn't exist so return old f
@@ -274,8 +300,14 @@ func NewFs(name, root string) (fs.Fs, error) {
 			}
 			return nil, err
 		}
+		f.features.Fill(&tempF)
+		// XXX: update the old f here instead of returning tempF, since
+		// `features` were already filled with functions having *f as a receiver.
+		// See https://github.com/ncw/rclone/issues/2182
+		f.dirCache = tempF.dirCache
+		f.root = tempF.root
 		// return an error with an fs which points to the parent
-		return &newF, fs.ErrorIsFile
+		return f, fs.ErrorIsFile
 	}
 	return f, nil
 }
@@ -498,10 +530,10 @@ func (f *Fs) createObject(remote string, modTime time.Time, size int64) (o *Obje
 //
 // The new object may have been created if an error is returned
 func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	exisitingObj, err := f.newObjectWithInfo(src.Remote(), nil)
+	existingObj, err := f.newObjectWithInfo(src.Remote(), nil)
 	switch err {
 	case nil:
-		return exisitingObj, exisitingObj.Update(in, src, options...)
+		return existingObj, existingObj.Update(in, src, options...)
 	case fs.ErrorObjectNotFound:
 		// Not found so create it
 		return f.PutUnchecked(in, src)
@@ -649,7 +681,7 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 		Parameters: fieldsValue(),
 	}
 	replacedLeaf := replaceReservedChars(leaf)
-	copy := api.CopyFile{
+	copyFile := api.CopyFile{
 		Name: replacedLeaf,
 		Parent: api.Parent{
 			ID: directoryID,
@@ -658,7 +690,7 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 	var resp *http.Response
 	var info *api.Item
 	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(&opts, &copy, &info)
+		resp, err = f.srv.CallJSON(&opts, &copyFile, &info)
 		return shouldRetry(resp, err)
 	})
 	if err != nil {
@@ -819,6 +851,46 @@ func (f *Fs) DirMove(src fs.Fs, srcRemote, dstRemote string) error {
 	return nil
 }
 
+// PublicLink adds a "readable by anyone with link" permission on the given file or folder.
+func (f *Fs) PublicLink(remote string) (string, error) {
+	id, err := f.dirCache.FindDir(remote, false)
+	var opts rest.Opts
+	if err == nil {
+		fs.Debugf(f, "attempting to share directory '%s'", remote)
+
+		opts = rest.Opts{
+			Method:     "PUT",
+			Path:       "/folders/" + id,
+			Parameters: fieldsValue(),
+		}
+	} else {
+		fs.Debugf(f, "attempting to share single file '%s'", remote)
+		o, err := f.NewObject(remote)
+		if err != nil {
+			return "", err
+		}
+
+		if o.(*Object).publicLink != "" {
+			return o.(*Object).publicLink, nil
+		}
+
+		opts = rest.Opts{
+			Method:     "PUT",
+			Path:       "/files/" + o.(*Object).id,
+			Parameters: fieldsValue(),
+		}
+	}
+
+	shareLink := api.CreateSharedLink{}
+	var info api.Item
+	var resp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(&opts, &shareLink, &info)
+		return shouldRetry(resp, err)
+	})
+	return info.SharedLink.URL, err
+}
+
 // DirCacheFlush resets the directory cache - used in testing as an
 // optional interface
 func (f *Fs) DirCacheFlush() {
@@ -883,6 +955,7 @@ func (o *Object) setMetaData(info *api.Item) (err error) {
 	o.sha1 = info.SHA1
 	o.modTime = info.ModTime()
 	o.id = info.ID
+	o.publicLink = info.SharedLink.URL
 	return nil
 }
 
@@ -989,8 +1062,8 @@ func (o *Object) upload(in io.Reader, leaf, directoryID string, modTime time.Tim
 	var resp *http.Response
 	var result api.FolderItems
 	opts := rest.Opts{
-		Method: "POST",
-		Body:   in,
+		Method:                "POST",
+		Body:                  in,
 		MultipartMetadataName: "attributes",
 		MultipartContentName:  "contents",
 		MultipartFileName:     upload.Name,
@@ -1035,7 +1108,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	}
 
 	// Upload with simple or multipart
-	if size <= int64(uploadCutoff) {
+	if size <= int64(o.fs.opt.UploadCutoff) {
 		err = o.upload(in, leaf, directoryID, modTime)
 	} else {
 		err = o.uploadMultipart(in, leaf, directoryID, size, modTime)
@@ -1062,6 +1135,7 @@ var (
 	_ fs.Mover           = (*Fs)(nil)
 	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.DirCacheFlusher = (*Fs)(nil)
+	_ fs.PublicLinker    = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ fs.IDer            = (*Object)(nil)
 )

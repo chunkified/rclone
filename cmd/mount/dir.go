@@ -3,6 +3,7 @@
 package mount
 
 import (
+	"context"
 	"os"
 	"time"
 
@@ -12,7 +13,6 @@ import (
 	"github.com/ncw/rclone/fs/log"
 	"github.com/ncw/rclone/vfs"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context" // switch to "context" when we stop supporting go1.8
 )
 
 // Dir represents a directory entry
@@ -20,7 +20,7 @@ type Dir struct {
 	*vfs.Dir
 }
 
-// Check interface satsified
+// Check interface satisfied
 var _ fusefs.Node = (*Dir)(nil)
 
 // Attr updates the attributes of a directory
@@ -189,7 +189,7 @@ var _ fusefs.NodeLinker = (*Dir)(nil)
 
 // Link creates a new directory entry in the receiver based on an
 // existing Node. Receiver must be a directory.
-func (d *Dir) Link(ctx context.Context, req *fuse.LinkRequest, old fusefs.Node) (new fusefs.Node, err error) {
-	defer log.Trace(d, "req=%v, old=%v", req, old)("new=%v, err=%v", &new, &err)
+func (d *Dir) Link(ctx context.Context, req *fuse.LinkRequest, old fusefs.Node) (newNode fusefs.Node, err error) {
+	defer log.Trace(d, "req=%v, old=%v", req, old)("new=%v, err=%v", &newNode, &err)
 	return nil, fuse.ENOSYS
 }

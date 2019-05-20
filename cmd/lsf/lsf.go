@@ -10,7 +10,6 @@ import (
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/hash"
 	"github.com/ncw/rclone/fs/operations"
-	"github.com/ncw/rclone/fs/walk"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
@@ -67,8 +66,11 @@ output:
     s - size
     t - modification time
     h - hash
-    i - ID of object if known
+    i - ID of object
+    o - Original ID of underlying object
     m - MimeType of object if known
+    e - encrypted name
+    T - tier of storage if known, eg "Hot" or "Cool"
 
 So if you wanted the path, size and modification time, you would use
 --format "pst", or maybe --format "tsp" to put the path last.
@@ -161,6 +163,12 @@ func Lsf(fsrc fs.Fs, out io.Writer) error {
 	list.SetCSV(csv)
 	list.SetDirSlash(dirSlash)
 	list.SetAbsolute(absolute)
+	var opt = operations.ListJSONOpt{
+		NoModTime: true,
+		DirsOnly:  dirsOnly,
+		FilesOnly: filesOnly,
+		Recurse:   recurse,
+	}
 
 	for _, char := range format {
 		switch char {
@@ -168,38 +176,31 @@ func Lsf(fsrc fs.Fs, out io.Writer) error {
 			list.AddPath()
 		case 't':
 			list.AddModTime()
+			opt.NoModTime = false
 		case 's':
 			list.AddSize()
 		case 'h':
 			list.AddHash(hashType)
+			opt.ShowHash = true
 		case 'i':
 			list.AddID()
 		case 'm':
 			list.AddMimeType()
+		case 'e':
+			list.AddEncrypted()
+			opt.ShowEncrypted = true
+		case 'o':
+			list.AddOrigID()
+			opt.ShowOrigIDs = true
+		case 'T':
+			list.AddTier()
 		default:
 			return errors.Errorf("Unknown format character %q", char)
 		}
 	}
 
-	return walk.Walk(fsrc, "", false, operations.ConfigMaxDepth(recurse), func(path string, entries fs.DirEntries, err error) error {
-		if err != nil {
-			fs.CountError(err)
-			fs.Errorf(path, "error listing: %v", err)
-			return nil
-		}
-		for _, entry := range entries {
-			_, isDir := entry.(fs.Directory)
-			if isDir {
-				if filesOnly {
-					continue
-				}
-			} else {
-				if dirsOnly {
-					continue
-				}
-			}
-			_, _ = fmt.Fprintln(out, list.Format(entry))
-		}
+	return operations.ListJSON(fsrc, "", &opt, func(item *operations.ListJSONItem) error {
+		_, _ = fmt.Fprintln(out, list.Format(item))
 		return nil
 	})
 }

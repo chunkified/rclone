@@ -86,10 +86,10 @@ func (f *Fs) newLargeUpload(o *Object, in io.Reader, src fs.ObjectInfo) (up *lar
 	parts := int64(0)
 	sha1SliceSize := int64(maxParts)
 	if size == -1 {
-		fs.Debugf(o, "Streaming upload with --b2-chunk-size %s allows uploads of up to %s and will fail only when that limit is reached.", fs.SizeSuffix(chunkSize), fs.SizeSuffix(maxParts*chunkSize))
+		fs.Debugf(o, "Streaming upload with --b2-chunk-size %s allows uploads of up to %s and will fail only when that limit is reached.", f.opt.ChunkSize, maxParts*f.opt.ChunkSize)
 	} else {
-		parts = size / int64(chunkSize)
-		if size%int64(chunkSize) != 0 {
+		parts = size / int64(o.fs.opt.ChunkSize)
+		if size%int64(o.fs.opt.ChunkSize) != 0 {
 			parts++
 		}
 		if parts > maxParts {
@@ -116,8 +116,10 @@ func (f *Fs) newLargeUpload(o *Object, in io.Reader, src fs.ObjectInfo) (up *lar
 		},
 	}
 	// Set the SHA1 if known
-	if calculatedSha1, err := src.Hash(hash.SHA1); err == nil && calculatedSha1 != "" {
-		request.Info[sha1Key] = calculatedSha1
+	if !o.fs.opt.DisableCheckSum {
+		if calculatedSha1, err := src.Hash(hash.SHA1); err == nil && calculatedSha1 != "" {
+			request.Info[sha1Key] = calculatedSha1
+		}
 	}
 	var response api.StartLargeFileResponse
 	err = f.pacer.Call(func() (bool, error) {
@@ -409,8 +411,8 @@ outer:
 		}
 
 		reqSize := remaining
-		if reqSize >= int64(chunkSize) {
-			reqSize = int64(chunkSize)
+		if reqSize >= int64(up.f.opt.ChunkSize) {
+			reqSize = int64(up.f.opt.ChunkSize)
 		}
 
 		// Get a block of memory

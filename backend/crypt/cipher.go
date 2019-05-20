@@ -17,11 +17,9 @@ import (
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/accounting"
 	"github.com/pkg/errors"
-
+	"github.com/rfjakob/eme"
 	"golang.org/x/crypto/nacl/secretbox"
 	"golang.org/x/crypto/scrypt"
-
-	"github.com/rfjakob/eme"
 )
 
 // Constants
@@ -43,6 +41,7 @@ var (
 	ErrorBadDecryptControlChar   = errors.New("bad decryption - contains control chars")
 	ErrorNotAMultipleOfBlocksize = errors.New("not a multiple of blocksize")
 	ErrorTooShortAfterDecode     = errors.New("too short after base32 decode")
+	ErrorTooLongAfterDecode      = errors.New("too long after base32 decode")
 	ErrorEncryptedFileTooShort   = errors.New("file is too short to be encrypted")
 	ErrorEncryptedFileBadHeader  = errors.New("file has truncated block header")
 	ErrorEncryptedBadMagic       = errors.New("not an encrypted file - bad magic string")
@@ -286,6 +285,9 @@ func (c *cipher) decryptSegment(ciphertext string) (string, error) {
 		// not possible if decodeFilename() working correctly
 		return "", ErrorTooShortAfterDecode
 	}
+	if len(rawCiphertext) > 2048 {
+		return "", ErrorTooLongAfterDecode
+	}
 	paddedPlaintext := eme.Transform(c.block, c.nameTweak[:], rawCiphertext, eme.DirectionDecrypt)
 	plaintext, err := pkcs7.Unpad(nameCipherBlockSize, paddedPlaintext)
 	if err != nil {
@@ -461,7 +463,7 @@ func (c *cipher) deobfuscateSegment(ciphertext string) (string, error) {
 			if int(newRune) < base {
 				newRune += 256
 			}
-			_, _ = result.WriteRune(rune(newRune))
+			_, _ = result.WriteRune(newRune)
 
 		default:
 			_, _ = result.WriteRune(runeValue)
@@ -746,7 +748,7 @@ func (c *cipher) newDecrypter(rc io.ReadCloser) (*decrypter, error) {
 	if !bytes.Equal(readBuf[:fileMagicSize], fileMagicBytes) {
 		return nil, fh.finishAndClose(ErrorEncryptedBadMagic)
 	}
-	// retreive the nonce
+	// retrieve the nonce
 	fh.nonce.fromBuf(readBuf[fileMagicSize:])
 	fh.initialNonce = fh.nonce
 	return fh, nil

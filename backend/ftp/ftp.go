@@ -4,18 +4,18 @@ package ftp
 import (
 	"io"
 	"net/textproto"
-	"net/url"
 	"os"
 	"path"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/jlaffaye/ftp"
 	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config"
+	"github.com/ncw/rclone/fs/config/configmap"
+	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/config/obscure"
 	"github.com/ncw/rclone/fs/hash"
+	"github.com/ncw/rclone/lib/pacer"
 	"github.com/ncw/rclone/lib/readers"
 	"github.com/pkg/errors"
 )
@@ -30,33 +30,46 @@ func init() {
 			{
 				Name:     "host",
 				Help:     "FTP host to connect to",
-				Optional: false,
+				Required: true,
 				Examples: []fs.OptionExample{{
 					Value: "ftp.example.com",
 					Help:  "Connect to ftp.example.com",
 				}},
 			}, {
-				Name:     "user",
-				Help:     "FTP username, leave blank for current username, " + os.Getenv("USER"),
-				Optional: true,
+				Name: "user",
+				Help: "FTP username, leave blank for current username, " + os.Getenv("USER"),
 			}, {
-				Name:     "port",
-				Help:     "FTP port, leave blank to use default (21) ",
-				Optional: true,
+				Name: "port",
+				Help: "FTP port, leave blank to use default (21)",
 			}, {
 				Name:       "pass",
 				Help:       "FTP password",
 				IsPassword: true,
-				Optional:   false,
+				Required:   true,
+			}, {
+				Name:     "concurrency",
+				Help:     "Maximum number of FTP simultaneous connections, 0 for unlimited",
+				Default:  0,
+				Advanced: true,
 			},
 		},
 	})
+}
+
+// Options defines the configuration for this backend
+type Options struct {
+	Host        string `config:"host"`
+	User        string `config:"user"`
+	Pass        string `config:"pass"`
+	Port        string `config:"port"`
+	Concurrency int    `config:"concurrency"`
 }
 
 // Fs represents a remote FTP server
 type Fs struct {
 	name     string       // name of this remote
 	root     string       // the path we are working on if any
+	opt      Options      // parsed options
 	features *fs.Features // optional features
 	url      string
 	user     string
@@ -64,6 +77,7 @@ type Fs struct {
 	dialAddr string
 	poolMu   sync.Mutex
 	pool     []*ftp.ServerConn
+	tokens   *pacer.TokenDispenser
 }
 
 // Object describes an FTP file
@@ -122,6 +136,9 @@ func (f *Fs) ftpConnection() (*ftp.ServerConn, error) {
 
 // Get an FTP connection from the pool, or open a new one
 func (f *Fs) getFtpConnection() (c *ftp.ServerConn, err error) {
+	if f.opt.Concurrency > 0 {
+		f.tokens.Get()
+	}
 	f.poolMu.Lock()
 	if len(f.pool) > 0 {
 		c = f.pool[0]
@@ -141,6 +158,9 @@ func (f *Fs) getFtpConnection() (c *ftp.ServerConn, err error) {
 // if err is not nil then it checks the connection is alive using a
 // NOOP request
 func (f *Fs) putFtpConnection(pc **ftp.ServerConn, err error) {
+	if f.opt.Concurrency > 0 {
+		defer f.tokens.Put()
+	}
 	c := *pc
 	*pc = nil
 	if err != nil {
@@ -160,56 +180,39 @@ func (f *Fs) putFtpConnection(pc **ftp.ServerConn, err error) {
 	f.poolMu.Unlock()
 }
 
-// NewFs contstructs an Fs from the path, container:path
-func NewFs(name, root string) (ff fs.Fs, err error) {
+// NewFs constructs an Fs from the path, container:path
+func NewFs(name, root string, m configmap.Mapper) (ff fs.Fs, err error) {
 	// defer fs.Trace(nil, "name=%q, root=%q", name, root)("fs=%v, err=%v", &ff, &err)
-	// FIXME Convert the old scheme used for the first beta - remove after release
-	if ftpURL := config.FileGet(name, "url"); ftpURL != "" {
-		fs.Infof(name, "Converting old configuration")
-		u, err := url.Parse(ftpURL)
-		if err != nil {
-			return nil, errors.Wrapf(err, "Failed to parse old url %q", ftpURL)
-		}
-		parts := strings.Split(u.Host, ":")
-		config.FileSet(name, "host", parts[0])
-		if len(parts) > 1 {
-			config.FileSet(name, "port", parts[1])
-		}
-		config.FileSet(name, "host", u.Host)
-		config.FileSet(name, "user", config.FileGet(name, "username"))
-		config.FileSet(name, "pass", config.FileGet(name, "password"))
-		config.FileDeleteKey(name, "username")
-		config.FileDeleteKey(name, "password")
-		config.FileDeleteKey(name, "url")
-		config.SaveConfig()
-		if u.Path != "" && u.Path != "/" {
-			fs.Errorf(name, "Path %q in FTP URL no longer supported - put it on the end of the remote %s:%s", u.Path, name, u.Path)
-		}
+	// Parse config into Options struct
+	opt := new(Options)
+	err = configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
 	}
-	host := config.FileGet(name, "host")
-	user := config.FileGet(name, "user")
-	pass := config.FileGet(name, "pass")
-	port := config.FileGet(name, "port")
-	pass, err = obscure.Reveal(pass)
+	pass, err := obscure.Reveal(opt.Pass)
 	if err != nil {
 		return nil, errors.Wrap(err, "NewFS decrypt password")
 	}
+	user := opt.User
 	if user == "" {
 		user = os.Getenv("USER")
 	}
+	port := opt.Port
 	if port == "" {
 		port = "21"
 	}
 
-	dialAddr := host + ":" + port
+	dialAddr := opt.Host + ":" + port
 	u := "ftp://" + path.Join(dialAddr+"/", root)
 	f := &Fs{
 		name:     name,
 		root:     root,
+		opt:      *opt,
 		url:      u,
 		user:     user,
 		pass:     pass,
 		dialAddr: dialAddr,
+		tokens:   pacer.NewTokenDispenser(opt.Concurrency),
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
@@ -342,11 +345,36 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "list")
 	}
-	files, err := c.List(path.Join(f.root, dir))
-	f.putFtpConnection(&c, err)
-	if err != nil {
-		return nil, translateErrorDir(err)
+
+	var listErr error
+	var files []*ftp.Entry
+
+	resultchan := make(chan []*ftp.Entry, 1)
+	errchan := make(chan error, 1)
+	go func() {
+		result, err := c.List(path.Join(f.root, dir))
+		f.putFtpConnection(&c, err)
+		if err != nil {
+			errchan <- err
+			return
+		}
+		resultchan <- result
+	}()
+
+	// Wait for List for up to Timeout seconds
+	timer := time.NewTimer(fs.Config.Timeout)
+	select {
+	case listErr = <-errchan:
+		timer.Stop()
+		return nil, translateErrorDir(listErr)
+	case files = <-resultchan:
+		timer.Stop()
+	case <-timer.C:
+		// if timer fired assume no error but connection dead
+		fs.Errorf(f, "Timeout when waiting for List")
+		return nil, errors.New("Timeout when waiting for List")
 	}
+
 	// Annoyingly FTP returns success for a directory which
 	// doesn't exist, so check it really doesn't exist if no
 	// entries found.
@@ -658,7 +686,21 @@ func (f *ftpReadCloser) Read(p []byte) (n int, err error) {
 
 // Close the FTP reader and return the connection to the pool
 func (f *ftpReadCloser) Close() error {
-	err := f.rc.Close()
+	var err error
+	errchan := make(chan error, 1)
+	go func() {
+		errchan <- f.rc.Close()
+	}()
+	// Wait for Close for up to 60 seconds
+	timer := time.NewTimer(60 * time.Second)
+	select {
+	case err = <-errchan:
+		timer.Stop()
+	case <-timer.C:
+		// if timer fired assume no error but connection dead
+		fs.Errorf(f.f, "Timeout when waiting for connection Close")
+		return nil
+	}
 	// if errors while reading or closing, dump the connection
 	if err != nil || f.err != nil {
 		_ = f.c.Quit()
@@ -716,6 +758,11 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	path := path.Join(o.fs.root, o.remote)
 	// remove the file if upload failed
 	remove := func() {
+		// Give the FTP server a chance to get its internal state in order after the error.
+		// The error may have been local in which case we closed the connection.  The server
+		// may still be dealing with it for a moment. A sleep isn't ideal but I haven't been
+		// able to think of a better method to find out if the server has finished - ncw
+		time.Sleep(1 * time.Second)
 		removeErr := o.Remove()
 		if removeErr != nil {
 			fs.Debugf(o, "Failed to remove: %v", removeErr)
@@ -729,7 +776,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	}
 	err = c.Stor(path, in)
 	if err != nil {
-		_ = c.Quit()
+		_ = c.Quit() // toss this connection to avoid sync errors
 		remove()
 		return errors.Wrap(err, "update stor")
 	}

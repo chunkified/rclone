@@ -27,9 +27,24 @@ Or individual files or directories:
 
     rclone rc vfs/forget file=path/to/file dir=path/to/dir
 
-### File Caching
+### File Buffering
 
-**NB** File caching is **EXPERIMENTAL** - use with care!
+The ` + "`--buffer-size`" + ` flag determines the amount of memory,
+that will be used to buffer data in advance.
+
+Each open file descriptor will try to keep the specified amount of
+data in memory at all times. The buffered data is bound to one file
+descriptor and won't be shared between multiple open file descriptors
+of the same file.
+
+This flag is a upper limit for the used memory per file descriptor.
+The buffer will only use memory for data that is downloaded but not
+not yet read. If the buffer is empty, only a small amount of memory
+will be used.
+The maximum memory used by rclone for buffering can be up to
+` + "`--buffer-size * open files`" + `.
+
+### File Caching
 
 These flags control the VFS file caching options.  The VFS layer is
 used by rclone mount to make a cloud storage system work more like a
@@ -45,6 +60,7 @@ may find that you need one or the other or both.
     --vfs-cache-max-age duration         Max age of objects in the cache. (default 1h0m0s)
     --vfs-cache-mode string              Cache mode off|minimal|writes|full (default "off")
     --vfs-cache-poll-interval duration   Interval to poll the cache for stale objects. (default 1m0s)
+    --vfs-cache-max-size int             Max total size of objects in the cache. (default off)
 
 If run with ` + "`-vv`" + ` rclone will print the location of the file cache.  The
 files are stored in the user cache file area which is OS dependent but
@@ -59,6 +75,11 @@ Note that files are written back to the remote only when they are
 closed so if rclone is quit or dies with open files then these won't
 get written back to the remote.  However they will still be in the on
 disk cache.
+
+If using --vfs-cache-max-size note that the cache may exceed this size
+for two reasons.  Firstly because it is only checked every
+--vfs-cache-poll-interval.  Secondly because open files cannot be
+evicted from the cache.
 
 #### --vfs-cache-mode off
 

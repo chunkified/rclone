@@ -5,14 +5,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httputil"
 	"reflect"
 	"sync"
 	"time"
 
 	"github.com/ncw/rclone/fs"
+	"golang.org/x/net/publicsuffix"
 	"golang.org/x/time/rate"
 )
 
@@ -22,9 +27,10 @@ const (
 )
 
 var (
-	transport   http.RoundTripper
-	noTransport sync.Once
-	tpsBucket   *rate.Limiter // for limiting number of http transactions per second
+	transport    http.RoundTripper
+	noTransport  = new(sync.Once)
+	tpsBucket    *rate.Limiter // for limiting number of http transactions per second
+	cookieJar, _ = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 )
 
 // StartHTTPTokenBucket starts the token bucket if necessary
@@ -115,9 +121,15 @@ func dialContextTimeout(ctx context.Context, network, address string, ci *fs.Con
 	return newTimeoutConn(c, ci.Timeout)
 }
 
+// ResetTransport resets the existing transport, allowing it to take new settings.
+// Should only be used for testing.
+func ResetTransport() {
+	noTransport = new(sync.Once)
+}
+
 // NewTransport returns an http.RoundTripper with the correct timeouts
 func NewTransport(ci *fs.ConfigInfo) http.RoundTripper {
-	noTransport.Do(func() {
+	(*noTransport).Do(func() {
 		// Start with a sensible set of defaults then override.
 		// This also means we get new stuff when it gets added to go
 		t := new(http.Transport)
@@ -127,7 +139,39 @@ func NewTransport(ci *fs.ConfigInfo) http.RoundTripper {
 		t.MaxIdleConns = 2 * t.MaxIdleConnsPerHost
 		t.TLSHandshakeTimeout = ci.ConnectTimeout
 		t.ResponseHeaderTimeout = ci.Timeout
-		t.TLSClientConfig = &tls.Config{InsecureSkipVerify: ci.InsecureSkipVerify}
+
+		// TLS Config
+		t.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: ci.InsecureSkipVerify,
+		}
+
+		// Load client certs
+		if ci.ClientCert != "" || ci.ClientKey != "" {
+			if ci.ClientCert == "" || ci.ClientKey == "" {
+				log.Fatalf("Both --client-cert and --client-key must be set")
+			}
+			cert, err := tls.LoadX509KeyPair(ci.ClientCert, ci.ClientKey)
+			if err != nil {
+				log.Fatalf("Failed to load --client-cert/--client-key pair: %v", err)
+			}
+			t.TLSClientConfig.Certificates = []tls.Certificate{cert}
+			t.TLSClientConfig.BuildNameToCertificate()
+		}
+
+		// Load CA cert
+		if ci.CaCert != "" {
+			caCert, err := ioutil.ReadFile(ci.CaCert)
+			if err != nil {
+				log.Fatalf("Failed to read --ca-cert: %v", err)
+			}
+			caCertPool := x509.NewCertPool()
+			ok := caCertPool.AppendCertsFromPEM(caCert)
+			if !ok {
+				log.Fatalf("Failed to add certificates from --ca-cert")
+			}
+			t.TLSClientConfig.RootCAs = caCertPool
+		}
+
 		t.DisableCompression = ci.NoGzip
 		t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dialContextTimeout(ctx, network, addr, ci)
@@ -142,9 +186,13 @@ func NewTransport(ci *fs.ConfigInfo) http.RoundTripper {
 
 // NewClient returns an http.Client with the correct timeouts
 func NewClient(ci *fs.ConfigInfo) *http.Client {
-	return &http.Client{
+	transport := &http.Client{
 		Transport: NewTransport(ci),
 	}
+	if ci.Cookie {
+		transport.Jar = cookieJar
+	}
+	return transport
 }
 
 // Transport is a our http Transport which wraps an http.Transport

@@ -10,11 +10,13 @@ import (
 // Globals
 var (
 	deleteEmptySrcDirs = false
+	createEmptySrcDirs = false
 )
 
 func init() {
 	cmd.Root.AddCommand(commandDefintion)
 	commandDefintion.Flags().BoolVarP(&deleteEmptySrcDirs, "delete-empty-src-dirs", "", deleteEmptySrcDirs, "Delete empty source dirs after move")
+	commandDefintion.Flags().BoolVarP(&createEmptySrcDirs, "create-empty-src-dirs", "", createEmptySrcDirs, "Create empty source dirs on destination after move")
 }
 
 var commandDefintion = &cobra.Command{
@@ -37,15 +39,22 @@ into ` + "`dest:path`" + ` then delete the original (if no errors on copy) in
 
 If you want to delete empty source directories after move, use the --delete-empty-src-dirs flag.
 
+See the [--no-traverse](/docs/#no-traverse) option for controlling
+whether rclone lists the destination directory or not.  Supplying this
+option when moving a small number of files into a large destination
+can speed transfers up greatly.
+
 **Important**: Since this can cause data loss, test first with the
 --dry-run flag.
+
+**Note**: Use the ` + "`-P`" + `/` + "`--progress`" + ` flag to view real-time transfer statistics.
 `,
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(2, 2, command, args)
 		fsrc, srcFileName, fdst := cmd.NewFsSrcFileDst(args)
 		cmd.Run(true, true, command, func() error {
 			if srcFileName == "" {
-				return sync.MoveDir(fdst, fsrc, deleteEmptySrcDirs)
+				return sync.MoveDir(fdst, fsrc, deleteEmptySrcDirs, createEmptySrcDirs)
 			}
 			return operations.MoveFile(fdst, fsrc, srcFileName, srcFileName)
 		})

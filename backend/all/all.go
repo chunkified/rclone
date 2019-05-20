@@ -15,6 +15,8 @@ import (
 	_ "github.com/ncw/rclone/backend/googlecloudstorage"
 	_ "github.com/ncw/rclone/backend/http"
 	_ "github.com/ncw/rclone/backend/hubic"
+	_ "github.com/ncw/rclone/backend/jottacloud"
+	_ "github.com/ncw/rclone/backend/koofr"
 	_ "github.com/ncw/rclone/backend/local"
 	_ "github.com/ncw/rclone/backend/mega"
 	_ "github.com/ncw/rclone/backend/onedrive"
@@ -24,6 +26,7 @@ import (
 	_ "github.com/ncw/rclone/backend/s3"
 	_ "github.com/ncw/rclone/backend/sftp"
 	_ "github.com/ncw/rclone/backend/swift"
+	_ "github.com/ncw/rclone/backend/union"
 	_ "github.com/ncw/rclone/backend/webdav"
 	_ "github.com/ncw/rclone/backend/yandex"
 )

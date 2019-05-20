@@ -1,5 +1,8 @@
 // Serve restic tests set up a server and run the integration tests
 // for restic against it.
+
+// +build go1.9
+
 package restic
 
 import (
@@ -14,8 +17,7 @@ import (
 )
 
 const (
-	testBindAddress = "localhost:51779"
-	testURL         = "http://" + testBindAddress + "/"
+	testBindAddress = "localhost:0"
 	resticSource    = "../../../../../restic/restic"
 )
 
@@ -41,8 +43,11 @@ func TestRestic(t *testing.T) {
 
 	// Start the server
 	w := newServer(fremote, &opt)
-	go w.serve()
-	defer w.srv.Close()
+	assert.NoError(t, w.Serve())
+	defer func() {
+		w.Close()
+		w.Wait()
+	}()
 
 	// Change directory to run the tests
 	err = os.Chdir(resticSource)
@@ -56,7 +61,7 @@ func TestRestic(t *testing.T) {
 		}
 		cmd := exec.Command("go", args...)
 		cmd.Env = append(os.Environ(),
-			"RESTIC_TEST_REST_REPOSITORY=rest:"+testURL+path,
+			"RESTIC_TEST_REST_REPOSITORY=rest:"+w.Server.URL()+path,
 		)
 		out, err := cmd.CombinedOutput()
 		if len(out) != 0 {

@@ -1,5 +1,3 @@
-// +build go1.8
-
 package http
 
 import (
@@ -16,6 +14,7 @@ import (
 
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/config"
+	"github.com/ncw/rclone/fs/config/configmap"
 	"github.com/ncw/rclone/fstest"
 	"github.com/ncw/rclone/lib/rest"
 	"github.com/stretchr/testify/assert"
@@ -29,7 +28,7 @@ var (
 )
 
 // prepareServer the test server and return a function to tidy it up afterwards
-func prepareServer(t *testing.T) func() {
+func prepareServer(t *testing.T) (configmap.Simple, func()) {
 	// file server for test/files
 	fileServer := http.FileServer(http.Dir(filesPath))
 
@@ -41,25 +40,30 @@ func prepareServer(t *testing.T) func() {
 	// fs.Config.LogLevel = fs.LogLevelDebug
 	// fs.Config.DumpHeaders = true
 	// fs.Config.DumpBodies = true
-	config.FileSet(remoteName, "type", "http")
-	config.FileSet(remoteName, "url", ts.URL)
+	// config.FileSet(remoteName, "type", "http")
+	// config.FileSet(remoteName, "url", ts.URL)
+
+	m := configmap.Simple{
+		"type": "http",
+		"url":  ts.URL,
+	}
 
 	// return a function to tidy up
-	return ts.Close
+	return m, ts.Close
 }
 
 // prepare the test server and return a function to tidy it up afterwards
 func prepare(t *testing.T) (fs.Fs, func()) {
-	tidy := prepareServer(t)
+	m, tidy := prepareServer(t)
 
 	// Instantiate it
-	f, err := NewFs(remoteName, "")
+	f, err := NewFs(remoteName, "", m)
 	require.NoError(t, err)
 
 	return f, tidy
 }
 
-func testListRoot(t *testing.T, f fs.Fs) {
+func testListRoot(t *testing.T, f fs.Fs, noSlash bool) {
 	entries, err := f.List("")
 	require.NoError(t, err)
 
@@ -87,15 +91,29 @@ func testListRoot(t *testing.T, f fs.Fs) {
 
 	e = entries[3]
 	assert.Equal(t, "two.html", e.Remote())
-	assert.Equal(t, int64(7), e.Size())
-	_, ok = e.(*Object)
-	assert.True(t, ok)
+	if noSlash {
+		assert.Equal(t, int64(-1), e.Size())
+		_, ok = e.(fs.Directory)
+		assert.True(t, ok)
+	} else {
+		assert.Equal(t, int64(41), e.Size())
+		_, ok = e.(*Object)
+		assert.True(t, ok)
+	}
 }
 
 func TestListRoot(t *testing.T) {
 	f, tidy := prepare(t)
 	defer tidy()
-	testListRoot(t, f)
+	testListRoot(t, f, false)
+}
+
+func TestListRootNoSlash(t *testing.T) {
+	f, tidy := prepare(t)
+	f.(*Fs).opt.NoSlash = true
+	defer tidy()
+
+	testListRoot(t, f, true)
 }
 
 func TestListSubDir(t *testing.T) {
@@ -138,6 +156,11 @@ func TestNewObject(t *testing.T) {
 
 	dt, ok := fstest.CheckTimeEqualWithPrecision(tObj, tFile, time.Second)
 	assert.True(t, ok, fmt.Sprintf("%s: Modification time difference too big |%s| > %s (%s vs %s) (precision %s)", o.Remote(), dt, time.Second, tObj, tFile, time.Second))
+
+	// check object not found
+	o, err = f.NewObject("not found.txt")
+	assert.Nil(t, o)
+	assert.Equal(t, fs.ErrorObjectNotFound, err)
 }
 
 func TestOpen(t *testing.T) {
@@ -177,20 +200,20 @@ func TestMimeType(t *testing.T) {
 }
 
 func TestIsAFileRoot(t *testing.T) {
-	tidy := prepareServer(t)
+	m, tidy := prepareServer(t)
 	defer tidy()
 
-	f, err := NewFs(remoteName, "one%.txt")
+	f, err := NewFs(remoteName, "one%.txt", m)
 	assert.Equal(t, err, fs.ErrorIsFile)
 
-	testListRoot(t, f)
+	testListRoot(t, f, false)
 }
 
 func TestIsAFileSubDir(t *testing.T) {
-	tidy := prepareServer(t)
+	m, tidy := prepareServer(t)
 	defer tidy()
 
-	f, err := NewFs(remoteName, "three/underthree.txt")
+	f, err := NewFs(remoteName, "three/underthree.txt", m)
 	assert.Equal(t, err, fs.ErrorIsFile)
 
 	entries, err := f.List("")

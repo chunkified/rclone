@@ -24,8 +24,8 @@ import (
 	"time"
 
 	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config"
-	"github.com/ncw/rclone/fs/config/flags"
+	"github.com/ncw/rclone/fs/config/configmap"
+	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/config/obscure"
 	"github.com/ncw/rclone/fs/fshttp"
 	"github.com/ncw/rclone/fs/hash"
@@ -39,12 +39,10 @@ const (
 	minSleep      = 10 * time.Millisecond
 	maxSleep      = 2 * time.Second
 	eventWaitTime = 500 * time.Millisecond
-	decayConstant = 2    // bigger for slower decay, exponential
-	useTrash      = true // FIXME make configurable - rclone global
+	decayConstant = 2 // bigger for slower decay, exponential
 )
 
 var (
-	megaDebug   = flags.BoolP("mega-debug", "", false, "If set then output more debug from mega.")
 	megaCacheMu sync.Mutex                // mutex for the below
 	megaCache   = map[string]*mega.Mega{} // cache logged in Mega's by user
 )
@@ -58,23 +56,49 @@ func init() {
 		Options: []fs.Option{{
 			Name:     "user",
 			Help:     "User name",
-			Optional: true,
+			Required: true,
 		}, {
 			Name:       "pass",
 			Help:       "Password.",
-			Optional:   true,
+			Required:   true,
 			IsPassword: true,
+		}, {
+			Name: "debug",
+			Help: `Output more debug from Mega.
+
+If this flag is set (along with -vv) it will print further debugging
+information from the mega backend.`,
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "hard_delete",
+			Help: `Delete files permanently rather than putting them into the trash.
+
+Normally the mega backend will put all deletions into the trash rather
+than permanently deleting them.  If you specify this then rclone will
+permanently delete objects instead.`,
+			Default:  false,
+			Advanced: true,
 		}},
 	})
+}
+
+// Options defines the configuration for this backend
+type Options struct {
+	User       string `config:"user"`
+	Pass       string `config:"pass"`
+	Debug      bool   `config:"debug"`
+	HardDelete bool   `config:"hard_delete"`
 }
 
 // Fs represents a remote mega
 type Fs struct {
 	name       string       // name of this remote
 	root       string       // the path we are working on
+	opt        Options      // parsed config options
 	features   *fs.Features // optional features
 	srv        *mega.Mega   // the connection to the server
-	pacer      *pacer.Pacer // pacer for API calls
+	pacer      *fs.Pacer    // pacer for API calls
 	rootNodeMu sync.Mutex   // mutex for _rootNode
 	_rootNode  *mega.Node   // root node - call findRoot to use this
 	mkdirMu    sync.Mutex   // used to serialize calls to mkdir / rmdir
@@ -145,12 +169,16 @@ func (f *Fs) readMetaDataForPath(remote string) (info *mega.Node, err error) {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string) (fs.Fs, error) {
-	user := config.FileGet(name, "user")
-	pass := config.FileGet(name, "pass")
-	if pass != "" {
+func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
+	}
+	if opt.Pass != "" {
 		var err error
-		pass, err = obscure.Reveal(pass)
+		opt.Pass, err = obscure.Reveal(opt.Pass)
 		if err != nil {
 			return nil, errors.Wrap(err, "couldn't decrypt password")
 		}
@@ -163,32 +191,33 @@ func NewFs(name, root string) (fs.Fs, error) {
 	// them up between different remotes.
 	megaCacheMu.Lock()
 	defer megaCacheMu.Unlock()
-	srv := megaCache[user]
+	srv := megaCache[opt.User]
 	if srv == nil {
 		srv = mega.New().SetClient(fshttp.NewClient(fs.Config))
 		srv.SetRetries(fs.Config.LowLevelRetries) // let mega do the low level retries
 		srv.SetLogger(func(format string, v ...interface{}) {
 			fs.Infof("*go-mega*", format, v...)
 		})
-		if *megaDebug {
+		if opt.Debug {
 			srv.SetDebugger(func(format string, v ...interface{}) {
 				fs.Debugf("*go-mega*", format, v...)
 			})
 		}
 
-		err := srv.Login(user, pass)
+		err := srv.Login(opt.User, opt.Pass)
 		if err != nil {
 			return nil, errors.Wrap(err, "couldn't login")
 		}
-		megaCache[user] = srv
+		megaCache[opt.User] = srv
 	}
 
 	root = parsePath(root)
 	f := &Fs{
 		name:  name,
 		root:  root,
+		opt:   *opt,
 		srv:   srv,
-		pacer: pacer.New().SetMinSleep(minSleep).SetMaxSleep(maxSleep).SetDecayConstant(decayConstant),
+		pacer: fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		DuplicateFiles:          true,
@@ -196,7 +225,7 @@ func NewFs(name, root string) (fs.Fs, error) {
 	}).Fill(f)
 
 	// Find the root node and check if it is a file or not
-	_, err := f.findRoot(false)
+	_, err = f.findRoot(false)
 	switch err {
 	case nil:
 		// root node found and is a directory
@@ -373,6 +402,35 @@ func (f *Fs) clearRoot() {
 	//log.Printf("cleared root directory")
 }
 
+// CleanUp deletes all files currently in trash
+func (f *Fs) CleanUp() (err error) {
+	trash := f.srv.FS.GetTrash()
+	items := []*mega.Node{}
+	_, err = f.list(trash, func(item *mega.Node) bool {
+		items = append(items, item)
+		return false
+	})
+	if err != nil {
+		return errors.Wrap(err, "CleanUp failed to list items in trash")
+	}
+	fs.Infof(f, "Deleting %d items from the trash", len(items))
+	errors := 0
+	// similar to f.deleteNode(trash) but with HardDelete as true
+	for _, item := range items {
+		fs.Debugf(f, "Deleting trash %q", item.GetName())
+		deleteErr := f.pacer.Call(func() (bool, error) {
+			err := f.srv.Delete(item, true)
+			return shouldRetry(err)
+		})
+		if deleteErr != nil {
+			err = deleteErr
+			errors++
+		}
+	}
+	fs.Infof(f, "Deleted %d items from the trash with %d errors", len(items), errors)
+	return err
+}
+
 // Return an Object from a path
 //
 // If it can't be found it returns the error fs.ErrorObjectNotFound.
@@ -468,7 +526,7 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 // Creates from the parameters passed in a half finished Object which
 // must have setMetaData called on it
 //
-// Returns the dirNode, obect, leaf and error
+// Returns the dirNode, object, leaf and error
 //
 // Used to create new objects
 func (f *Fs) createObject(remote string, modTime time.Time, size int64) (o *Object, dirNode *mega.Node, leaf string, err error) {
@@ -494,10 +552,10 @@ func (f *Fs) createObject(remote string, modTime time.Time, size int64) (o *Obje
 // This will create a duplicate if we upload a new file without
 // checking to see if there is one already - use Put() for that.
 func (f *Fs) Put(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	exisitingObj, err := f.newObjectWithInfo(src.Remote(), nil)
+	existingObj, err := f.newObjectWithInfo(src.Remote(), nil)
 	switch err {
 	case nil:
-		return exisitingObj, exisitingObj.Update(in, src, options...)
+		return existingObj, existingObj.Update(in, src, options...)
 	case fs.ErrorObjectNotFound:
 		// Not found so create it
 		return f.PutUnchecked(in, src)
@@ -540,7 +598,7 @@ func (f *Fs) Mkdir(dir string) error {
 // deleteNode removes a file or directory, observing useTrash
 func (f *Fs) deleteNode(node *mega.Node) (err error) {
 	err = f.pacer.Call(func() (bool, error) {
-		err = f.srv.Delete(node, !useTrash)
+		err = f.srv.Delete(node, f.opt.HardDelete)
 		return shouldRetry(err)
 	})
 	return err
@@ -818,14 +876,14 @@ func (f *Fs) MergeDirs(dirs []fs.Directory) error {
 				return shouldRetry(err)
 			})
 			if err != nil {
-				return errors.Wrapf(err, "MergDirs move failed on %q in %v", info.GetName(), srcDir)
+				return errors.Wrapf(err, "MergeDirs move failed on %q in %v", info.GetName(), srcDir)
 			}
 		}
 		// rmdir (into trash) the now empty source directory
 		fs.Infof(srcDir, "removing empty directory")
 		err = f.deleteNode(srcDirNode)
 		if err != nil {
-			return errors.Wrapf(err, "MergDirs move failed to rmdir %q", srcDir)
+			return errors.Wrapf(err, "MergeDirs move failed to rmdir %q", srcDir)
 		}
 	}
 	return nil
@@ -1047,6 +1105,9 @@ func (o *Object) Open(options ...fs.OpenOption) (in io.ReadCloser, err error) {
 // The new object may have been created if an error is returned
 func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
 	size := src.Size()
+	if size < 0 {
+		return errors.New("mega backend can't upload a file of unknown length")
+	}
 	//modTime := src.ModTime()
 	remote := o.Remote()
 
@@ -1097,7 +1158,7 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		return errors.Wrap(err, "failed to finish upload")
 	}
 
-	// If the upload succeded and the original object existed, then delete it
+	// If the upload succeeded and the original object existed, then delete it
 	if o.info != nil {
 		err = o.fs.deleteNode(o.info)
 		if err != nil {

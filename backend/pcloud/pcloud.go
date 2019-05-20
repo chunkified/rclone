@@ -23,6 +23,8 @@ import (
 	"github.com/ncw/rclone/backend/pcloud/api"
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/config"
+	"github.com/ncw/rclone/fs/config/configmap"
+	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/config/obscure"
 	"github.com/ncw/rclone/fs/fserrors"
 	"github.com/ncw/rclone/fs/hash"
@@ -65,30 +67,35 @@ func init() {
 		Name:        "pcloud",
 		Description: "Pcloud",
 		NewFs:       NewFs,
-		Config: func(name string) {
-			err := oauthutil.Config("pcloud", name, oauthConfig)
+		Config: func(name string, m configmap.Mapper) {
+			err := oauthutil.Config("pcloud", name, m, oauthConfig)
 			if err != nil {
 				log.Fatalf("Failed to configure token: %v", err)
 			}
 		},
 		Options: []fs.Option{{
 			Name: config.ConfigClientID,
-			Help: "Pcloud App Client Id - leave blank normally.",
+			Help: "Pcloud App Client Id\nLeave blank normally.",
 		}, {
 			Name: config.ConfigClientSecret,
-			Help: "Pcloud App Client Secret - leave blank normally.",
+			Help: "Pcloud App Client Secret\nLeave blank normally.",
 		}},
 	})
+}
+
+// Options defines the configuration for this backend
+type Options struct {
 }
 
 // Fs represents a remote pcloud
 type Fs struct {
 	name         string             // name of this remote
 	root         string             // the path we are working on
+	opt          Options            // parsed options
 	features     *fs.Features       // optional features
 	srv          *rest.Client       // the connection to the server
 	dirCache     *dircache.DirCache // Map of directory path to directory id
-	pacer        *pacer.Pacer       // pacer for API calls
+	pacer        *fs.Pacer          // pacer for API calls
 	tokenRenewer *oauthutil.Renew   // renew the token on expiry
 }
 
@@ -229,18 +236,25 @@ func errorHandler(resp *http.Response) error {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string) (fs.Fs, error) {
-	root = parsePath(root)
-	oAuthClient, ts, err := oauthutil.NewClient(name, oauthConfig)
+func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
 	if err != nil {
-		log.Fatalf("Failed to configure Pcloud: %v", err)
+		return nil, err
+	}
+	root = parsePath(root)
+	oAuthClient, ts, err := oauthutil.NewClient(name, m, oauthConfig)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to configure Pcloud")
 	}
 
 	f := &Fs{
 		name:  name,
 		root:  root,
+		opt:   *opt,
 		srv:   rest.NewClient(oAuthClient).SetRoot(rootURL),
-		pacer: pacer.New().SetMinSleep(minSleep).SetMaxSleep(maxSleep).SetDecayConstant(decayConstant),
+		pacer: fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		CaseInsensitive:         false,
@@ -262,16 +276,16 @@ func NewFs(name, root string) (fs.Fs, error) {
 	if err != nil {
 		// Assume it is a file
 		newRoot, remote := dircache.SplitPath(root)
-		newF := *f
-		newF.dirCache = dircache.New(newRoot, rootID, &newF)
-		newF.root = newRoot
+		tempF := *f
+		tempF.dirCache = dircache.New(newRoot, rootID, &tempF)
+		tempF.root = newRoot
 		// Make new Fs which is the parent
-		err = newF.dirCache.FindRoot(false)
+		err = tempF.dirCache.FindRoot(false)
 		if err != nil {
 			// No root so return old f
 			return f, nil
 		}
-		_, err := newF.newObjectWithInfo(remote, nil)
+		_, err := tempF.newObjectWithInfo(remote, nil)
 		if err != nil {
 			if err == fs.ErrorObjectNotFound {
 				// File doesn't exist so return old f
@@ -279,8 +293,13 @@ func NewFs(name, root string) (fs.Fs, error) {
 			}
 			return nil, err
 		}
+		// XXX: update the old f here instead of returning tempF, since
+		// `features` were already filled with functions having *f as a receiver.
+		// See https://github.com/ncw/rclone/issues/2182
+		f.dirCache = tempF.dirCache
+		f.root = tempF.root
 		// return an error with an fs which points to the parent
-		return &newF, fs.ErrorIsFile
+		return f, fs.ErrorIsFile
 	}
 	return f, nil
 }
@@ -366,7 +385,7 @@ func fileIDtoNumber(fileID string) string {
 	if len(fileID) > 0 && fileID[0] == 'f' {
 		return fileID[1:]
 	}
-	fs.Debugf(nil, "Invalid filee id %q", fileID)
+	fs.Debugf(nil, "Invalid file id %q", fileID)
 	return fileID
 }
 
@@ -1093,6 +1112,12 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		return shouldRetry(resp, err)
 	})
 	if err != nil {
+		// sometimes pcloud leaves a half complete file on
+		// error, so delete it if it exists
+		delObj, delErr := o.fs.NewObject(o.remote)
+		if delErr == nil && delObj != nil {
+			_ = delObj.Remove()
+		}
 		return err
 	}
 	if len(result.Items) != 1 {

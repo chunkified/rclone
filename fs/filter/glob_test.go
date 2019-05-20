@@ -41,15 +41,21 @@ func TestGlobToRegexp(t *testing.T) {
 		{`a\*b`, `(^|/)a\*b$`, ``},
 		{`a\\b`, `(^|/)a\\b$`, ``},
 	} {
-		gotRe, err := globToRegexp(test.in)
-		if test.error == "" {
-			got := gotRe.String()
-			require.NoError(t, err, test.in)
-			assert.Equal(t, test.want, got, test.in)
-		} else {
-			require.Error(t, err, test.in)
-			assert.Contains(t, err.Error(), test.error, test.in)
-			assert.Nil(t, gotRe)
+		for _, ignoreCase := range []bool{false, true} {
+			gotRe, err := globToRegexp(test.in, ignoreCase)
+			if test.error == "" {
+				prefix := ""
+				if ignoreCase {
+					prefix = "(?i)"
+				}
+				got := gotRe.String()
+				require.NoError(t, err, test.in)
+				assert.Equal(t, prefix+test.want, got, test.in)
+			} else {
+				require.Error(t, err, test.in)
+				assert.Contains(t, err.Error(), test.error, test.in)
+				assert.Nil(t, gotRe)
+			}
 		}
 	}
 }
@@ -96,9 +102,51 @@ func TestGlobToDirGlobs(t *testing.T) {
 		{"/sausage3**", []string{`/sausage3**/`, "/"}},
 		{"/a/*.jpg", []string{`/a/`, "/"}},
 	} {
-		_, err := globToRegexp(test.in)
+		_, err := globToRegexp(test.in, false)
 		assert.NoError(t, err)
 		got := globToDirGlobs(test.in)
+		assert.Equal(t, test.want, got, test.in)
+	}
+}
+
+func TestGlobBoundedRecursion(t *testing.T) {
+	for _, test := range []struct {
+		in   string
+		want bool
+	}{
+		{`*`, false},
+		{`/*`, true},
+		{`/**`, false},
+		{`*.jpg`, false},
+		{`/*.jpg`, true},
+		{`/a/*.jpg`, true},
+		{`/a/b/*.jpg`, true},
+		{`*/*/*.jpg`, false},
+		{`a/b/`, false},
+		{`a/b`, false},
+		{`a/b/*.{png,gif}`, false},
+		{`/a/{jpg,png,gif}/*.{jpg,true,gif}`, true},
+		{`a/{a,a*b,a**c}/d/`, false},
+		{`/a/{a,a*b,a/c,d}/d/`, true},
+		{`**`, false},
+		{`a**`, false},
+		{`a**b`, false},
+		{`a**b**c**d`, false},
+		{`a**b/c**d`, false},
+		{`/A/a**b/B/c**d/C/`, false},
+		{`/var/spool/**/ncw`, false},
+		{`var/spool/**/ncw/`, false},
+		{"/file1.jpg", true},
+		{"/file2.png", true},
+		{"/*.jpg", true},
+		{"/*.png", true},
+		{"/potato", true},
+		{"/sausage1", true},
+		{"/sausage2*", true},
+		{"/sausage3**", false},
+		{"/a/*.jpg", true},
+	} {
+		got := globBoundedRecursion(test.in)
 		assert.Equal(t, test.want, got, test.in)
 	}
 }

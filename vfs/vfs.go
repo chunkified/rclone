@@ -43,11 +43,14 @@ var DefaultOpt = Options{
 	Umask:             0,
 	UID:               ^uint32(0), // these values instruct WinFSP-FUSE to use the current user
 	GID:               ^uint32(0), // overriden for non windows in mount_unix.go
-	DirPerms:          os.FileMode(0777) | os.ModeDir,
+	DirPerms:          os.FileMode(0777),
 	FilePerms:         os.FileMode(0666),
 	CacheMode:         CacheModeOff,
 	CacheMaxAge:       3600 * time.Second,
 	CachePollInterval: 60 * time.Second,
+	ChunkSize:         128 * fs.MebiByte,
+	ChunkSizeLimit:    -1,
+	CacheMaxSize:      -1,
 }
 
 // Node represents either a directory (*Dir) or a file (*File)
@@ -174,6 +177,7 @@ type VFS struct {
 	usageMu   sync.Mutex
 	usageTime time.Time
 	usage     *fs.Usage
+	pollChan  chan time.Duration
 }
 
 // Options is options for creating the vfs
@@ -193,6 +197,7 @@ type Options struct {
 	ChunkSizeLimit    fs.SizeSuffix // if > ChunkSize double the chunk size after each chunk until reached
 	CacheMode         CacheMode
 	CacheMaxAge       time.Duration
+	CacheMaxSize      fs.SizeSuffix
 	CachePollInterval time.Duration
 }
 
@@ -221,13 +226,13 @@ func New(f fs.Fs, opt *Options) *VFS {
 	// Create root directory
 	vfs.root = newDir(vfs, f, nil, fsDir)
 
-	// Start polling if required
-	if vfs.Opt.PollInterval > 0 {
-		if do := vfs.f.Features().ChangeNotify; do != nil {
-			do(vfs.notifyFunc, vfs.Opt.PollInterval)
-		} else {
-			fs.Infof(f, "poll-interval is not supported by this remote")
-		}
+	// Start polling function
+	if do := vfs.f.Features().ChangeNotify; do != nil {
+		vfs.pollChan = make(chan time.Duration)
+		do(vfs.root.ForgetPath, vfs.pollChan)
+		vfs.pollChan <- vfs.Opt.PollInterval
+	} else {
+		fs.Infof(f, "poll-interval is not supported by this remote")
 	}
 
 	vfs.SetCacheMode(vfs.Opt.CacheMode)
@@ -288,7 +293,7 @@ func (vfs *VFS) WaitForWriters(timeout time.Duration) {
 	tick.Stop()
 	for {
 		writers := 0
-		vfs.root.walk("", func(d *Dir) {
+		vfs.root.walk(func(d *Dir) {
 			fs.Debugf(d.path, "Looking for writers")
 			// NB d.mu is held by walk() here
 			for leaf, item := range d.items {
@@ -494,14 +499,4 @@ func (vfs *VFS) Statfs() (total, used, free int64) {
 		}
 	}
 	return
-}
-
-// notifyFunc removes the last path segement for directories and calls ForgetPath with the result.
-//
-// This ensures that new or renamed directories appear in their parent.
-func (vfs *VFS) notifyFunc(relativePath string, entryType fs.EntryType) {
-	if entryType == fs.EntryDirectory {
-		relativePath = path.Dir(relativePath)
-	}
-	vfs.root.ForgetPath(relativePath, entryType)
 }

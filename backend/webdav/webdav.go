@@ -2,23 +2,13 @@
 // object storage system.
 package webdav
 
-// Owncloud: Getting Oc-Checksum:
-// SHA1:f572d396fae9206628714fb2ce00f72e94f2258f on HEAD but not on
-// nextcloud?
-
-// docs for file webdav
-// https://docs.nextcloud.com/server/12/developer_manual/client_apis/WebDAV/index.html
-
-// indicates checksums can be set as metadata here
-// https://github.com/nextcloud/server/issues/6129
-// owncloud seems to have checksums as metadata though - can read them
-
 // SetModTime might be possible
 // https://stackoverflow.com/questions/3579608/webdav-can-a-client-modify-the-mtime-of-a-file
 // ...support for a PROPSET to lastmodified (mind the missing get) which does the utime() call might be an option.
 // For example the ownCloud WebDAV server does it that way.
 
 import (
+	"bytes"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -31,7 +21,8 @@ import (
 	"github.com/ncw/rclone/backend/webdav/api"
 	"github.com/ncw/rclone/backend/webdav/odrvcookie"
 	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config"
+	"github.com/ncw/rclone/fs/config/configmap"
+	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/config/obscure"
 	"github.com/ncw/rclone/fs/fserrors"
 	"github.com/ncw/rclone/fs/fshttp"
@@ -44,7 +35,8 @@ import (
 const (
 	minSleep      = 10 * time.Millisecond
 	maxSleep      = 2 * time.Second
-	decayConstant = 2 // bigger for slower decay, exponential
+	decayConstant = 2   // bigger for slower decay, exponential
+	defaultDepth  = "1" // depth for PROPFIND
 )
 
 // Register with Fs
@@ -56,15 +48,14 @@ func init() {
 		Options: []fs.Option{{
 			Name:     "url",
 			Help:     "URL of http host to connect to",
-			Optional: false,
+			Required: true,
 			Examples: []fs.OptionExample{{
 				Value: "https://example.com",
 				Help:  "Connect to example.com",
 			}},
 		}, {
-			Name:     "vendor",
-			Help:     "Name of the Webdav site/service/software you are using",
-			Optional: false,
+			Name: "vendor",
+			Help: "Name of the Webdav site/service/software you are using",
 			Examples: []fs.OptionExample{{
 				Value: "nextcloud",
 				Help:  "Nextcloud",
@@ -79,37 +70,43 @@ func init() {
 				Help:  "Other site/service or software",
 			}},
 		}, {
-			Name:     "user",
-			Help:     "User name",
-			Optional: true,
+			Name: "user",
+			Help: "User name",
 		}, {
 			Name:       "pass",
 			Help:       "Password.",
-			Optional:   true,
 			IsPassword: true,
 		}, {
-			Name:     "bearer_token",
-			Help:     "Bearer token instead of user/pass (eg a Macaroon)",
-			Optional: true,
+			Name: "bearer_token",
+			Help: "Bearer token instead of user/pass (eg a Macaroon)",
 		}},
 	})
 }
 
+// Options defines the configuration for this backend
+type Options struct {
+	URL         string `config:"url"`
+	Vendor      string `config:"vendor"`
+	User        string `config:"user"`
+	Pass        string `config:"pass"`
+	BearerToken string `config:"bearer_token"`
+}
+
 // Fs represents a remote webdav
 type Fs struct {
-	name        string        // name of this remote
-	root        string        // the path we are working on
-	features    *fs.Features  // optional features
-	endpoint    *url.URL      // URL of the host
-	endpointURL string        // endpoint as a string
-	srv         *rest.Client  // the connection to the one drive server
-	pacer       *pacer.Pacer  // pacer for API calls
-	user        string        // username
-	pass        string        // password
-	vendor      string        // name of the vendor
-	precision   time.Duration // mod time precision
-	canStream   bool          // set if can stream
-	useOCMtime  bool          // set if can use X-OC-Mtime
+	name               string        // name of this remote
+	root               string        // the path we are working on
+	opt                Options       // parsed options
+	features           *fs.Features  // optional features
+	endpoint           *url.URL      // URL of the host
+	endpointURL        string        // endpoint as a string
+	srv                *rest.Client  // the connection to the one drive server
+	pacer              *fs.Pacer     // pacer for API calls
+	precision          time.Duration // mod time precision
+	canStream          bool          // set if can stream
+	useOCMtime         bool          // set if can use X-OC-Mtime
+	retryWithZeroDepth bool          // some vendors (sharepoint) won't list files when Depth is 1 (our default)
+	hasChecksums       bool          // set if can use owncloud style checksums
 }
 
 // Object describes a webdav object
@@ -121,7 +118,8 @@ type Object struct {
 	hasMetaData bool      // whether info below has been set
 	size        int64     // size of the object
 	modTime     time.Time // modification time of the object
-	sha1        string    // SHA-1 of the object content
+	sha1        string    // SHA-1 of the object content if known
+	md5         string    // MD5 of the object content if known
 }
 
 // ------------------------------------------------------------
@@ -174,19 +172,34 @@ func itemIsDir(item *api.Response) bool {
 		}
 		fs.Debugf(nil, "Unknown resource type %q/%q on %q", t.Space, t.Local, item.Props.Name)
 	}
+	// the iscollection prop is a Microsoft extension, but if present it is a reliable indicator
+	// if the above check failed - see #2716. This can be an integer or a boolean - see #2964
+	if t := item.Props.IsCollection; t != nil {
+		switch x := strings.ToLower(*t); x {
+		case "0", "false":
+			return false
+		case "1", "true":
+			return true
+		default:
+			fs.Debugf(nil, "Unknown value %q for IsCollection", x)
+		}
+	}
 	return false
 }
 
 // readMetaDataForPath reads the metadata from the path
-func (f *Fs) readMetaDataForPath(path string) (info *api.Prop, err error) {
+func (f *Fs) readMetaDataForPath(path string, depth string) (info *api.Prop, err error) {
 	// FIXME how do we read back additional properties?
 	opts := rest.Opts{
 		Method: "PROPFIND",
 		Path:   f.filePath(path),
 		ExtraHeaders: map[string]string{
-			"Depth": "1",
+			"Depth": depth,
 		},
 		NoRedirect: true,
+	}
+	if f.hasChecksums {
+		opts.Body = bytes.NewBuffer(owncloudProps)
 	}
 	var result api.Multistatus
 	var resp *http.Response
@@ -198,6 +211,9 @@ func (f *Fs) readMetaDataForPath(path string) (info *api.Prop, err error) {
 		// does not exist
 		switch apiErr.StatusCode {
 		case http.StatusNotFound:
+			if f.retryWithZeroDepth && depth != "0" {
+				return f.readMetaDataForPath(path, "0")
+			}
 			return nil, fs.ErrorObjectNotFound
 		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther:
 			// Some sort of redirect - go doesn't deal with these properly (it resets
@@ -240,7 +256,7 @@ func errorHandler(resp *http.Response) error {
 	return errResponse
 }
 
-// addShlash makes sure s is terminated with a / if non empty
+// addSlash makes sure s is terminated with a / if non empty
 func addSlash(s string) string {
 	if s != "" && !strings.HasSuffix(s, "/") {
 		s += "/"
@@ -264,28 +280,33 @@ func (o *Object) filePath() string {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string) (fs.Fs, error) {
-	endpoint := config.FileGet(name, "url")
-	if !strings.HasSuffix(endpoint, "/") {
-		endpoint += "/"
+func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
 	}
 	rootIsDir := strings.HasSuffix(root, "/")
 	root = strings.Trim(root, "/")
 
-	user := config.FileGet(name, "user")
-	pass := config.FileGet(name, "pass")
-	bearerToken := config.FileGet(name, "bearer_token")
-	if pass != "" {
+	if !strings.HasSuffix(opt.URL, "/") {
+		opt.URL += "/"
+	}
+	if opt.Pass != "" {
 		var err error
-		pass, err = obscure.Reveal(pass)
+		opt.Pass, err = obscure.Reveal(opt.Pass)
 		if err != nil {
 			return nil, errors.Wrap(err, "couldn't decrypt password")
 		}
 	}
-	vendor := config.FileGet(name, "vendor")
+	if opt.Vendor == "" {
+		opt.Vendor = "other"
+	}
+	root = strings.Trim(root, "/")
 
 	// Parse the endpoint
-	u, err := url.Parse(endpoint)
+	u, err := url.Parse(opt.URL)
 	if err != nil {
 		return nil, err
 	}
@@ -293,24 +314,23 @@ func NewFs(name, root string) (fs.Fs, error) {
 	f := &Fs{
 		name:        name,
 		root:        root,
+		opt:         *opt,
 		endpoint:    u,
 		endpointURL: u.String(),
 		srv:         rest.NewClient(fshttp.NewClient(fs.Config)).SetRoot(u.String()),
-		pacer:       pacer.New().SetMinSleep(minSleep).SetMaxSleep(maxSleep).SetDecayConstant(decayConstant),
-		user:        user,
-		pass:        pass,
+		pacer:       fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		precision:   fs.ModTimeNotSupported,
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 	}).Fill(f)
-	if user != "" || pass != "" {
-		f.srv.SetUserPass(user, pass)
-	} else if bearerToken != "" {
-		f.srv.SetHeader("Authorization", "BEARER "+bearerToken)
+	if opt.User != "" || opt.Pass != "" {
+		f.srv.SetUserPass(opt.User, opt.Pass)
+	} else if opt.BearerToken != "" {
+		f.srv.SetHeader("Authorization", "BEARER "+opt.BearerToken)
 	}
 	f.srv.SetErrorHandler(errorHandler)
-	err = f.setQuirks(vendor)
+	err = f.setQuirks(opt.Vendor)
 	if err != nil {
 		return nil, err
 	}
@@ -339,28 +359,43 @@ func NewFs(name, root string) (fs.Fs, error) {
 
 // setQuirks adjusts the Fs for the vendor passed in
 func (f *Fs) setQuirks(vendor string) error {
-	if vendor == "" {
-		vendor = "other"
-	}
-	f.vendor = vendor
 	switch vendor {
 	case "owncloud":
 		f.canStream = true
 		f.precision = time.Second
 		f.useOCMtime = true
+		f.hasChecksums = true
 	case "nextcloud":
 		f.precision = time.Second
 		f.useOCMtime = true
+		f.hasChecksums = true
 	case "sharepoint":
 		// To mount sharepoint, two Cookies are required
 		// They have to be set instead of BasicAuth
 		f.srv.RemoveHeader("Authorization") // We don't need this Header if using cookies
-		spCk := odrvcookie.New(f.user, f.pass, f.endpointURL)
+		spCk := odrvcookie.New(f.opt.User, f.opt.Pass, f.endpointURL)
 		spCookies, err := spCk.Cookies()
 		if err != nil {
 			return err
 		}
+
+		odrvcookie.NewRenew(12*time.Hour, func() {
+			spCookies, err := spCk.Cookies()
+			if err != nil {
+				fs.Errorf("could not renew cookies: %s", err.Error())
+				return
+			}
+			f.srv.SetCookie(&spCookies.FedAuth, &spCookies.RtFa)
+			fs.Debugf(spCookies, "successfully renewed sharepoint cookies")
+		})
+
 		f.srv.SetCookie(&spCookies.FedAuth, &spCookies.RtFa)
+
+		// sharepoint, unlike the other vendors, only lists files if the depth header is set to 0
+		// however, rclone defaults to 1 since it provides recursive directory listing
+		// to determine if we may have found a file, the request has to be resent
+		// with the depth set to 0
+		f.retryWithZeroDepth = true
 	case "other":
 	default:
 		fs.Debugf(f, "Unknown vendor %q", vendor)
@@ -400,6 +435,22 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 	return f.newObjectWithInfo(remote, nil)
 }
 
+// Read the normal props, plus the checksums
+//
+// <oc:checksums><oc:checksum>SHA1:f572d396fae9206628714fb2ce00f72e94f2258f MD5:b1946ac92492d2347c6235b4d2611184 ADLER32:084b021f</oc:checksum></oc:checksums>
+var owncloudProps = []byte(`<?xml version="1.0"?>
+<d:propfind  xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
+ <d:prop>
+  <d:displayname />
+  <d:getlastmodified />
+  <d:getcontentlength />
+  <d:resourcetype />
+  <d:getcontenttype />
+  <oc:checksums />
+ </d:prop>
+</d:propfind>
+`)
+
 // list the objects into the function supplied
 //
 // If directories is set it only sends directories
@@ -411,13 +462,16 @@ type listAllFn func(string, bool, *api.Prop) bool
 // Lists the directory required calling the user function on each item found
 //
 // If the user fn ever returns true then it early exits with found = true
-func (f *Fs) listAll(dir string, directoriesOnly bool, filesOnly bool, fn listAllFn) (found bool, err error) {
+func (f *Fs) listAll(dir string, directoriesOnly bool, filesOnly bool, depth string, fn listAllFn) (found bool, err error) {
 	opts := rest.Opts{
 		Method: "PROPFIND",
 		Path:   f.dirPath(dir), // FIXME Should not start with /
 		ExtraHeaders: map[string]string{
-			"Depth": "1",
+			"Depth": depth,
 		},
+	}
+	if f.hasChecksums {
+		opts.Body = bytes.NewBuffer(owncloudProps)
 	}
 	var result api.Multistatus
 	var resp *http.Response
@@ -429,6 +483,9 @@ func (f *Fs) listAll(dir string, directoriesOnly bool, filesOnly bool, fn listAl
 		if apiErr, ok := err.(*api.Error); ok {
 			// does not exist
 			if apiErr.StatusCode == http.StatusNotFound {
+				if f.retryWithZeroDepth && depth != "0" {
+					return f.listAll(dir, directoriesOnly, filesOnly, "0", fn)
+				}
 				return found, fs.ErrorDirNotFound
 			}
 		}
@@ -502,7 +559,7 @@ func (f *Fs) listAll(dir string, directoriesOnly bool, filesOnly bool, fn listAl
 // found.
 func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 	var iErr error
-	_, err = f.listAll(dir, false, false, func(remote string, isDir bool, info *api.Prop) bool {
+	_, err = f.listAll(dir, false, false, defaultDepth, func(remote string, isDir bool, info *api.Prop) bool {
 		if isDir {
 			d := fs.NewDir(remote, time.Time(info.Modified))
 			// .SetID(info.ID)
@@ -572,10 +629,9 @@ func (f *Fs) mkParentDir(dirPath string) error {
 	return f.mkdir(parent)
 }
 
-// mkdir makes the directory and parents using native paths
-func (f *Fs) mkdir(dirPath string) error {
-	// defer log.Trace(dirPath, "")("")
-	// We assume the root is already ceated
+// low level mkdir, only makes the directory, doesn't attempt to create parents
+func (f *Fs) _mkdir(dirPath string) error {
+	// We assume the root is already created
 	if dirPath == "" {
 		return nil
 	}
@@ -594,14 +650,24 @@ func (f *Fs) mkdir(dirPath string) error {
 	})
 	if apiErr, ok := err.(*api.Error); ok {
 		// already exists
-		if apiErr.StatusCode == http.StatusMethodNotAllowed || apiErr.StatusCode == http.StatusNotAcceptable {
+		// owncloud returns 423/StatusLocked if the create is already in progress
+		if apiErr.StatusCode == http.StatusMethodNotAllowed || apiErr.StatusCode == http.StatusNotAcceptable || apiErr.StatusCode == http.StatusLocked {
 			return nil
 		}
-		// parent does not exists
+	}
+	return err
+}
+
+// mkdir makes the directory and parents using native paths
+func (f *Fs) mkdir(dirPath string) error {
+	// defer log.Trace(dirPath, "")("")
+	err := f._mkdir(dirPath)
+	if apiErr, ok := err.(*api.Error); ok {
+		// parent does not exist so create it first then try again
 		if apiErr.StatusCode == http.StatusConflict {
 			err = f.mkParentDir(dirPath)
 			if err == nil {
-				err = f.mkdir(dirPath)
+				err = f._mkdir(dirPath)
 			}
 		}
 	}
@@ -618,7 +684,7 @@ func (f *Fs) Mkdir(dir string) error {
 //
 // if the directory does not exist then err will be ErrorDirNotFound
 func (f *Fs) dirNotEmpty(dir string) (found bool, err error) {
-	return f.listAll(dir, false, false, func(remote string, isDir bool, info *api.Prop) bool {
+	return f.listAll(dir, false, false, defaultDepth, func(remote string, isDir bool, info *api.Prop) bool {
 		return true
 	})
 }
@@ -813,7 +879,52 @@ func (f *Fs) DirMove(src fs.Fs, srcRemote, dstRemote string) error {
 
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
+	if f.hasChecksums {
+		return hash.NewHashSet(hash.MD5, hash.SHA1)
+	}
 	return hash.Set(hash.None)
+}
+
+// About gets quota information
+func (f *Fs) About() (*fs.Usage, error) {
+	opts := rest.Opts{
+		Method: "PROPFIND",
+		Path:   "",
+		ExtraHeaders: map[string]string{
+			"Depth": "0",
+		},
+	}
+	opts.Body = bytes.NewBuffer([]byte(`<?xml version="1.0" ?>
+<D:propfind xmlns:D="DAV:">
+ <D:prop>
+  <D:quota-available-bytes/>
+  <D:quota-used-bytes/>
+ </D:prop>
+</D:propfind>
+`))
+	var q = api.Quota{
+		Available: -1,
+		Used:      -1,
+	}
+	var resp *http.Response
+	var err error
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallXML(&opts, nil, &q)
+		return shouldRetry(resp, err)
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "about call failed")
+	}
+	usage := &fs.Usage{}
+	if q.Available != 0 || q.Used != 0 {
+		if q.Available >= 0 && q.Used >= 0 {
+			usage.Total = fs.NewUsageValue(q.Available + q.Used)
+		}
+		if q.Used >= 0 {
+			usage.Used = fs.NewUsageValue(q.Used)
+		}
+	}
+	return usage, nil
 }
 
 // ------------------------------------------------------------
@@ -836,12 +947,17 @@ func (o *Object) Remote() string {
 	return o.remote
 }
 
-// Hash returns the SHA-1 of an object returning a lowercase hex string
+// Hash returns the SHA1 or MD5 of an object returning a lowercase hex string
 func (o *Object) Hash(t hash.Type) (string, error) {
-	if t != hash.SHA1 {
-		return "", hash.ErrUnsupported
+	if o.fs.hasChecksums {
+		switch t {
+		case hash.SHA1:
+			return o.sha1, nil
+		case hash.MD5:
+			return o.md5, nil
+		}
 	}
-	return o.sha1, nil
+	return "", hash.ErrUnsupported
 }
 
 // Size returns the size of an object in bytes
@@ -859,6 +975,11 @@ func (o *Object) setMetaData(info *api.Prop) (err error) {
 	o.hasMetaData = true
 	o.size = info.Size
 	o.modTime = time.Time(info.Modified)
+	if o.fs.hasChecksums {
+		hashes := info.Hashes()
+		o.sha1 = hashes[hash.SHA1]
+		o.md5 = hashes[hash.MD5]
+	}
 	return nil
 }
 
@@ -869,7 +990,7 @@ func (o *Object) readMetaData() (err error) {
 	if o.hasMetaData {
 		return nil
 	}
-	info, err := o.fs.readMetaDataForPath(o.remote)
+	info, err := o.fs.readMetaDataForPath(o.remote, defaultDepth)
 	if err != nil {
 		return err
 	}
@@ -936,10 +1057,23 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		Body:          in,
 		NoResponse:    true,
 		ContentLength: &size, // FIXME this isn't necessary with owncloud - See https://github.com/nextcloud/nextcloud-snap/issues/365
+		ContentType:   fs.MimeType(src),
 	}
-	if o.fs.useOCMtime {
-		opts.ExtraHeaders = map[string]string{
-			"X-OC-Mtime": fmt.Sprintf("%f", float64(src.ModTime().UnixNano())/1E9),
+	if o.fs.useOCMtime || o.fs.hasChecksums {
+		opts.ExtraHeaders = map[string]string{}
+		if o.fs.useOCMtime {
+			opts.ExtraHeaders["X-OC-Mtime"] = fmt.Sprintf("%f", float64(src.ModTime().UnixNano())/1E9)
+		}
+		if o.fs.hasChecksums {
+			// Set an upload checksum - prefer SHA1
+			//
+			// This is used as an upload integrity test. If we set
+			// only SHA1 here, owncloud will calculate the MD5 too.
+			if sha1, _ := src.Hash(hash.SHA1); sha1 != "" {
+				opts.ExtraHeaders["OC-Checksum"] = "SHA1:" + sha1
+			} else if md5, _ := src.Hash(hash.MD5); md5 != "" {
+				opts.ExtraHeaders["OC-Checksum"] = "MD5:" + md5
+			}
 		}
 	}
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
@@ -947,6 +1081,14 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		return shouldRetry(resp, err)
 	})
 	if err != nil {
+		// Give the WebDAV server a chance to get its internal state in order after the
+		// error.  The error may have been local in which case we closed the connection.
+		// The server may still be dealing with it for a moment. A sleep isn't ideal but I
+		// haven't been able to think of a better method to find out if the server has
+		// finished - ncw
+		time.Sleep(1 * time.Second)
+		// Remove failed upload
+		_ = o.Remove()
 		return err
 	}
 	// read metadata from remote
@@ -975,5 +1117,6 @@ var (
 	_ fs.Copier      = (*Fs)(nil)
 	_ fs.Mover       = (*Fs)(nil)
 	_ fs.DirMover    = (*Fs)(nil)
+	_ fs.Abouter     = (*Fs)(nil)
 	_ fs.Object      = (*Object)(nil)
 )

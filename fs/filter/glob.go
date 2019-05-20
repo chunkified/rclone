@@ -13,8 +13,11 @@ import (
 // globToRegexp converts an rsync style glob to a regexp
 //
 // documented in filtering.md
-func globToRegexp(glob string) (*regexp.Regexp, error) {
+func globToRegexp(glob string, ignoreCase bool) (*regexp.Regexp, error) {
 	var re bytes.Buffer
+	if ignoreCase {
+		_, _ = re.WriteString("(?i)")
+	}
 	if strings.HasPrefix(glob, "/") {
 		glob = glob[1:]
 		_, _ = re.WriteRune('^')
@@ -163,4 +166,16 @@ func globToDirGlobs(glob string) (out []string) {
 	}
 
 	return out
+}
+
+// globBoundedRecursion returns true if the glob only needs bounded
+// recursion in the file tree to evaluate.
+func globBoundedRecursion(glob string) bool {
+	if strings.Contains(glob, "**") {
+		return false
+	}
+	if strings.HasPrefix(glob, "/") {
+		return true
+	}
+	return false
 }

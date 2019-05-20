@@ -6,8 +6,8 @@ import (
 	"io"
 	"sync"
 	"time"
+	"unicode/utf8"
 
-	"github.com/VividCortex/ewma"
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/asyncreader"
 	"github.com/ncw/rclone/fs/fserrors"
@@ -31,17 +31,19 @@ type Account struct {
 	close   io.Closer
 	size    int64
 	name    string
-	statmu  sync.Mutex         // Separate mutex for stat values.
-	bytes   int64              // Total number of bytes read
-	max     int64              // if >=0 the max number of bytes to transfer
-	start   time.Time          // Start time of first read
-	lpTime  time.Time          // Time of last average measurement
-	lpBytes int                // Number of bytes read since last measurement
-	avg     ewma.MovingAverage // Moving average of last few measurements
-	closed  bool               // set if the file is closed
-	exit    chan struct{}      // channel that will be closed when transfer is finished
-	withBuf bool               // is using a buffered in
+	statmu  sync.Mutex    // Separate mutex for stat values.
+	bytes   int64         // Total number of bytes read
+	max     int64         // if >=0 the max number of bytes to transfer
+	start   time.Time     // Start time of first read
+	lpTime  time.Time     // Time of last average measurement
+	lpBytes int           // Number of bytes read since last measurement
+	avg     float64       // Moving average of last few measurements in bytes/s
+	closed  bool          // set if the file is closed
+	exit    chan struct{} // channel that will be closed when transfer is finished
+	withBuf bool          // is using a buffered in
 }
+
+const averagePeriod = 16 // period to do exponentially weighted averages over
 
 // NewAccountSizeName makes a Account reader for an io.ReadCloser of
 // the given size and name
@@ -53,7 +55,7 @@ func NewAccountSizeName(in io.ReadCloser, size int64, name string) *Account {
 		size:   size,
 		name:   name,
 		exit:   make(chan struct{}),
-		avg:    ewma.NewMovingAverage(),
+		avg:    0,
 		lpTime: time.Now(),
 		max:    int64(fs.Config.MaxTransfer),
 	}
@@ -96,6 +98,16 @@ func (acc *Account) GetReader() io.ReadCloser {
 	return acc.origIn
 }
 
+// GetAsyncReader returns the current AsyncReader or nil if Account is unbuffered
+func (acc *Account) GetAsyncReader() *asyncreader.AsyncReader {
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	if asyncIn, ok := acc.in.(*asyncreader.AsyncReader); ok {
+		return asyncIn
+	}
+	return nil
+}
+
 // StopBuffering stops the async buffer doing any more buffering
 func (acc *Account) StopBuffering() {
 	if asyncIn, ok := acc.in.(*asyncreader.AsyncReader); ok {
@@ -104,7 +116,7 @@ func (acc *Account) StopBuffering() {
 }
 
 // UpdateReader updates the underlying io.ReadCloser stopping the
-// asynb buffer (if any) and re-adding it
+// async buffer (if any) and re-adding it
 func (acc *Account) UpdateReader(in io.ReadCloser) {
 	acc.mu.Lock()
 	acc.StopBuffering()
@@ -118,6 +130,7 @@ func (acc *Account) UpdateReader(in io.ReadCloser) {
 // averageLoop calculates averages for the stats in the background
 func (acc *Account) averageLoop() {
 	tick := time.NewTicker(time.Second)
+	var period float64
 	defer tick.Stop()
 	for {
 		select {
@@ -126,7 +139,11 @@ func (acc *Account) averageLoop() {
 			// Add average of last second.
 			elapsed := now.Sub(acc.lpTime).Seconds()
 			avg := float64(acc.lpBytes) / elapsed
-			acc.avg.Add(avg)
+			// Soft start the moving average
+			if period < averagePeriod {
+				period++
+			}
+			acc.avg = (avg + (period-1)*acc.avg) / period
 			acc.lpBytes = 0
 			acc.lpTime = now
 			// Unlock stats
@@ -137,21 +154,23 @@ func (acc *Account) averageLoop() {
 	}
 }
 
-// read bytes from the io.Reader passed in and account them
-func (acc *Account) read(in io.Reader, p []byte) (n int, err error) {
+// Check the read is valid
+func (acc *Account) checkRead() (err error) {
 	acc.statmu.Lock()
 	if acc.max >= 0 && Stats.GetBytes() >= acc.max {
 		acc.statmu.Unlock()
-		return 0, ErrorMaxTransferLimitReached
+		return ErrorMaxTransferLimitReached
 	}
 	// Set start time.
 	if acc.start.IsZero() {
 		acc.start = time.Now()
 	}
 	acc.statmu.Unlock()
+	return nil
+}
 
-	n, err = in.Read(p)
-
+// Account the read and limit bandwidth
+func (acc *Account) accountRead(n int) {
 	// Update Stats
 	acc.statmu.Lock()
 	acc.lpBytes += n
@@ -161,7 +180,16 @@ func (acc *Account) read(in io.Reader, p []byte) (n int, err error) {
 	Stats.Bytes(int64(n))
 
 	limitBandwidth(n)
-	return
+}
+
+// read bytes from the io.Reader passed in and account them
+func (acc *Account) read(in io.Reader, p []byte) (n int, err error) {
+	err = acc.checkRead()
+	if err == nil {
+		n, err = in.Read(p)
+		acc.accountRead(n)
+	}
+	return n, err
 }
 
 // Read bytes from the object - see io.Reader
@@ -169,6 +197,17 @@ func (acc *Account) Read(p []byte) (n int, err error) {
 	acc.mu.Lock()
 	defer acc.mu.Unlock()
 	return acc.read(acc.in, p)
+}
+
+// AccountRead account having read n bytes
+func (acc *Account) AccountRead(n int) (err error) {
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	err = acc.checkRead()
+	if err == nil {
+		acc.accountRead(n)
+	}
+	return err
 }
 
 // Close the object
@@ -181,6 +220,9 @@ func (acc *Account) Close() error {
 	acc.closed = true
 	close(acc.exit)
 	Stats.inProgress.clear(acc.name)
+	if acc.close == nil {
+		return nil
+	}
 	return acc.close.Close()
 }
 
@@ -211,33 +253,38 @@ func (acc *Account) speed() (bps, current float64) {
 	// Calculate speed from first read.
 	total := float64(time.Now().Sub(acc.start)) / float64(time.Second)
 	bps = float64(acc.bytes) / total
-	current = acc.avg.Value()
+	current = acc.avg
 	return
 }
 
 // eta returns the ETA of the current operation,
 // rounded to full seconds.
 // If the ETA cannot be determined 'ok' returns false.
-func (acc *Account) eta() (eta time.Duration, ok bool) {
-	if acc == nil || acc.size <= 0 {
+func (acc *Account) eta() (etaDuration time.Duration, ok bool) {
+	if acc == nil {
 		return 0, false
 	}
 	acc.statmu.Lock()
 	defer acc.statmu.Unlock()
-	if acc.bytes == 0 {
-		return 0, false
-	}
-	left := acc.size - acc.bytes
-	if left <= 0 {
-		return 0, true
-	}
-	avg := acc.avg.Value()
-	if avg <= 0 {
-		return 0, false
-	}
-	seconds := float64(left) / acc.avg.Value()
+	return eta(acc.bytes, acc.size, acc.avg)
+}
 
-	return time.Duration(time.Second * time.Duration(int(seconds))), true
+// shortenName shortens in to size runes long
+// If size <= 0 then in is left untouched
+func shortenName(in string, size int) string {
+	if size <= 0 {
+		return in
+	}
+	if utf8.RuneCountInString(in) <= size {
+		return in
+	}
+	name := []rune(in)
+	size-- // don't count elipsis rune
+	suffixLength := size / 2
+	prefixLength := size - suffixLength
+	suffixStart := len(name) - suffixLength
+	name = append(append(name[:prefixLength], '…'), name[suffixStart:]...)
+	return string(name)
 }
 
 // String produces stats for this file
@@ -253,13 +300,6 @@ func (acc *Account) String() string {
 			etas = "0s"
 		}
 	}
-	name := []rune(acc.name)
-	if fs.Config.StatsFileNameLength > 0 {
-		if len(name) > fs.Config.StatsFileNameLength {
-			where := len(name) - fs.Config.StatsFileNameLength
-			name = append([]rune{'.', '.', '.'}, name[where:]...)
-		}
-	}
 
 	if fs.Config.DataRateUnit == "bits" {
 		cur = cur * 8
@@ -270,14 +310,44 @@ func (acc *Account) String() string {
 		percentageDone = int(100 * float64(a) / float64(b))
 	}
 
-	done := fmt.Sprintf("%2d%% /%s", percentageDone, fs.SizeSuffix(b))
-
-	return fmt.Sprintf("%45s: %s, %s/s, %s",
-		string(name),
-		done,
+	return fmt.Sprintf("%*s:%3d%% /%s, %s/s, %s",
+		fs.Config.StatsFileNameLength,
+		shortenName(acc.name, fs.Config.StatsFileNameLength),
+		percentageDone,
+		fs.SizeSuffix(b),
 		fs.SizeSuffix(cur),
 		etas,
 	)
+}
+
+// RemoteStats produces stats for this file
+func (acc *Account) RemoteStats() (out map[string]interface{}) {
+	out = make(map[string]interface{})
+	a, b := acc.progress()
+	out["bytes"] = a
+	out["size"] = b
+	spd, cur := acc.speed()
+	out["speed"] = spd
+	out["speedAvg"] = cur
+
+	eta, etaok := acc.eta()
+	out["eta"] = nil
+	if etaok {
+		if eta > 0 {
+			out["eta"] = eta.Seconds()
+		} else {
+			out["eta"] = 0
+		}
+	}
+	out["name"] = acc.name
+
+	percentageDone := 0
+	if b > 0 {
+		percentageDone = int(100 * float64(a) / float64(b))
+	}
+	out["percentage"] = percentageDone
+
+	return out
 }
 
 // OldStream returns the top io.Reader

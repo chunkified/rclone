@@ -6,6 +6,7 @@ package http
 
 import (
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"path"
@@ -14,7 +15,8 @@ import (
 	"time"
 
 	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config"
+	"github.com/ncw/rclone/fs/config/configmap"
+	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/fshttp"
 	"github.com/ncw/rclone/fs/hash"
 	"github.com/ncw/rclone/lib/rest"
@@ -35,14 +37,39 @@ func init() {
 		Options: []fs.Option{{
 			Name:     "url",
 			Help:     "URL of http host to connect to",
-			Optional: false,
+			Required: true,
 			Examples: []fs.OptionExample{{
 				Value: "https://example.com",
 				Help:  "Connect to example.com",
+			}, {
+				Value: "https://user:pass@example.com",
+				Help:  "Connect to example.com using a username and password",
 			}},
+		}, {
+			Name: "no_slash",
+			Help: `Set this if the site doesn't end directories with /
+
+Use this if your target website does not use / on the end of
+directories.
+
+A / on the end of a path is how rclone normally tells the difference
+between files and directories.  If this flag is set, then rclone will
+treat all files with Content-Type: text/html as directories and read
+URLs from them rather than downloading them.
+
+Note that this may cause rclone to confuse genuine HTML files with
+directories.`,
+			Default:  false,
+			Advanced: true,
 		}},
 	}
 	fs.Register(fsi)
+}
+
+// Options defines the configuration for this backend
+type Options struct {
+	Endpoint string `config:"url"`
+	NoSlash  bool   `config:"no_slash"`
 }
 
 // Fs stores the interface to the remote HTTP files
@@ -50,6 +77,7 @@ type Fs struct {
 	name        string
 	root        string
 	features    *fs.Features // optional features
+	opt         Options      // options for this backend
 	endpoint    *url.URL
 	endpointURL string // endpoint as a string
 	httpClient  *http.Client
@@ -78,14 +106,20 @@ func statusError(res *http.Response, err error) error {
 
 // NewFs creates a new Fs object from the name and root. It connects to
 // the host specified in the config file.
-func NewFs(name, root string) (fs.Fs, error) {
-	endpoint := config.FileGet(name, "url")
-	if !strings.HasSuffix(endpoint, "/") {
-		endpoint += "/"
+func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
+	}
+
+	if !strings.HasSuffix(opt.Endpoint, "/") {
+		opt.Endpoint += "/"
 	}
 
 	// Parse the endpoint and stick the root onto it
-	base, err := url.Parse(endpoint)
+	base, err := url.Parse(opt.Endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +164,7 @@ func NewFs(name, root string) (fs.Fs, error) {
 	f := &Fs{
 		name:        name,
 		root:        root,
+		opt:         *opt,
 		httpClient:  client,
 		endpoint:    u,
 		endpointURL: u.String(),
@@ -179,7 +214,7 @@ func (f *Fs) NewObject(remote string) (fs.Object, error) {
 	}
 	err := o.stat()
 	if err != nil {
-		return nil, errors.Wrap(err, "Stat failed")
+		return nil, err
 	}
 	return o, nil
 }
@@ -234,7 +269,7 @@ func parseName(base *url.URL, name string) (string, error) {
 	}
 	// calculate the name relative to the base
 	name = u.Path[len(base.Path):]
-	// musn't be empty
+	// mustn't be empty
 	if name == "" {
 		return "", errNameIsEmpty
 	}
@@ -253,14 +288,20 @@ func parse(base *url.URL, in io.Reader) (names []string, err error) {
 	if err != nil {
 		return nil, err
 	}
-	var walk func(*html.Node)
+	var (
+		walk func(*html.Node)
+		seen = make(map[string]struct{})
+	)
 	walk = func(n *html.Node) {
 		if n.Type == html.ElementNode && n.Data == "a" {
 			for _, a := range n.Attr {
 				if a.Key == "href" {
 					name, err := parseName(base, a.Val)
 					if err == nil {
-						names = append(names, name)
+						if _, found := seen[name]; !found {
+							names = append(names, name)
+							seen[name] = struct{}{}
+						}
 					}
 					break
 				}
@@ -285,14 +326,16 @@ func (f *Fs) readDir(dir string) (names []string, err error) {
 		return nil, errors.Errorf("internal error: readDir URL %q didn't end in /", URL)
 	}
 	res, err := f.httpClient.Get(URL)
-	if err == nil && res.StatusCode == http.StatusNotFound {
-		return nil, fs.ErrorDirNotFound
+	if err == nil {
+		defer fs.CheckClose(res.Body, &err)
+		if res.StatusCode == http.StatusNotFound {
+			return nil, fs.ErrorDirNotFound
+		}
 	}
 	err = statusError(res, err)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to readDir")
 	}
-	defer fs.CheckClose(res.Body, &err)
 
 	contentType := strings.SplitN(res.Header.Get("Content-Type"), ";", 2)[0]
 	switch contentType {
@@ -336,11 +379,16 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 				fs:     f,
 				remote: remote,
 			}
-			if err = file.stat(); err != nil {
+			switch err = file.stat(); err {
+			case nil:
+				entries = append(entries, file)
+			case fs.ErrorNotAFile:
+				// ...found a directory not a file
+				dir := fs.NewDir(remote, timeUnset)
+				entries = append(entries, dir)
+			default:
 				fs.Debugf(remote, "skipping because of error: %v", err)
-				continue
 			}
-			entries = append(entries, file)
 		}
 	}
 	return entries, nil
@@ -402,6 +450,9 @@ func (o *Object) url() string {
 func (o *Object) stat() error {
 	url := o.url()
 	res, err := o.fs.httpClient.Head(url)
+	if err == nil && res.StatusCode == http.StatusNotFound {
+		return fs.ErrorObjectNotFound
+	}
 	err = statusError(res, err)
 	if err != nil {
 		return errors.Wrap(err, "failed to stat")
@@ -413,6 +464,16 @@ func (o *Object) stat() error {
 	o.size = parseInt64(res.Header.Get("Content-Length"), -1)
 	o.modTime = t
 	o.contentType = res.Header.Get("Content-Type")
+	// If NoSlash is set then check ContentType to see if it is a directory
+	if o.fs.opt.NoSlash {
+		mediaType, _, err := mime.ParseMediaType(o.contentType)
+		if err != nil {
+			return errors.Wrapf(err, "failed to parse Content-Type: %q", o.contentType)
+		}
+		if mediaType == "text/html" {
+			return fs.ErrorNotAFile
+		}
+	}
 	return nil
 }
 

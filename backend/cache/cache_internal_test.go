@@ -4,6 +4,9 @@ package cache_test
 
 import (
 	"bytes"
+	"encoding/base64"
+	goflag "flag"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -12,20 +15,11 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/pkg/errors"
-
-	"encoding/base64"
-	goflag "flag"
-	"fmt"
-	"runtime/debug"
-
-	"encoding/json"
-	"net/http"
 
 	"github.com/ncw/rclone/backend/cache"
 	"github.com/ncw/rclone/backend/crypt"
@@ -33,13 +27,14 @@ import (
 	"github.com/ncw/rclone/backend/local"
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/config"
+	"github.com/ncw/rclone/fs/config/configmap"
 	"github.com/ncw/rclone/fs/object"
 	"github.com/ncw/rclone/fs/rc"
-	"github.com/ncw/rclone/fs/rc/rcflags"
 	"github.com/ncw/rclone/fstest"
 	"github.com/ncw/rclone/vfs"
 	"github.com/ncw/rclone/vfs/vfsflags"
-	flag "github.com/spf13/pflag"
+	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -140,7 +135,7 @@ func TestInternalVfsCache(t *testing.T) {
 
 	vfsflags.Opt.CacheMode = vfs.CacheModeWrites
 	id := "tiuufo"
-	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, true, true, nil, map[string]string{"cache-writes": "true", "cache-info-age": "1h"})
+	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, true, true, nil, map[string]string{"writes": "true", "info_age": "1h"})
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
 	err := rootFs.Mkdir("test")
@@ -392,10 +387,10 @@ func TestInternalWrappedWrittenContentMatches(t *testing.T) {
 
 	// write the object
 	o := runInstance.writeObjectBytes(t, cfs.UnWrap(), "data.bin", testData)
-	require.Equal(t, o.Size(), int64(testSize))
+	require.Equal(t, o.Size(), testSize)
 	time.Sleep(time.Second * 3)
 
-	checkSample, err := runInstance.readDataFromRemote(t, rootFs, "data.bin", 0, int64(testSize), false)
+	checkSample, err := runInstance.readDataFromRemote(t, rootFs, "data.bin", 0, testSize, false)
 	require.NoError(t, err)
 	require.Equal(t, int64(len(checkSample)), o.Size())
 
@@ -695,11 +690,11 @@ func TestInternalChangeSeenAfterDirCacheFlush(t *testing.T) {
 }
 
 func TestInternalChangeSeenAfterRc(t *testing.T) {
-	rcflags.Opt.Enabled = true
-	rc.Start(&rcflags.Opt)
+	cacheExpire := rc.Calls.Get("cache/expire")
+	assert.NotNil(t, cacheExpire)
 
 	id := fmt.Sprintf("ticsarc%v", time.Now().Unix())
-	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, false, true, nil, map[string]string{"rc": "true"})
+	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, false, true, nil, nil)
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
 	if !runInstance.useMount {
@@ -729,13 +724,9 @@ func TestInternalChangeSeenAfterRc(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, o.ModTime().String(), co.ModTime().String())
 
-	m := make(map[string]string)
-	res, err := http.Post(fmt.Sprintf("http://localhost:5572/cache/expire?remote=%s", "data.bin"), "application/json; charset=utf-8", strings.NewReader(""))
+	// Call the rc function
+	m, err := cacheExpire.Fn(rc.Params{"remote": "data.bin"})
 	require.NoError(t, err)
-	defer func() {
-		_ = res.Body.Close()
-	}()
-	_ = json.NewDecoder(res.Body).Decode(&m)
 	require.Contains(t, m, "status")
 	require.Contains(t, m, "message")
 	require.Equal(t, "ok", m["status"])
@@ -745,23 +736,21 @@ func TestInternalChangeSeenAfterRc(t *testing.T) {
 	co, err = rootFs.NewObject("data.bin")
 	require.NoError(t, err)
 	require.Equal(t, wrappedTime.Unix(), co.ModTime().Unix())
-	li1, err := runInstance.list(t, rootFs, "")
+	_, err = runInstance.list(t, rootFs, "")
+	require.NoError(t, err)
 
 	// create some rand test data
 	testData2 := randStringBytes(int(chunkSize))
 	runInstance.writeObjectBytes(t, cfs.UnWrap(), runInstance.encryptRemoteIfNeeded(t, "test2"), testData2)
 
 	// list should have 1 item only
-	li1, err = runInstance.list(t, rootFs, "")
+	li1, err := runInstance.list(t, rootFs, "")
+	require.NoError(t, err)
 	require.Len(t, li1, 1)
 
-	m = make(map[string]string)
-	res2, err := http.Post("http://localhost:5572/cache/expire?remote=/", "application/json; charset=utf-8", strings.NewReader(""))
+	// Call the rc function
+	m, err = cacheExpire.Fn(rc.Params{"remote": "/"})
 	require.NoError(t, err)
-	defer func() {
-		_ = res2.Body.Close()
-	}()
-	_ = json.NewDecoder(res2.Body).Decode(&m)
 	require.Contains(t, m, "status")
 	require.Contains(t, m, "message")
 	require.Equal(t, "ok", m["status"])
@@ -769,12 +758,13 @@ func TestInternalChangeSeenAfterRc(t *testing.T) {
 
 	// list should have 2 items now
 	li2, err := runInstance.list(t, rootFs, "")
+	require.NoError(t, err)
 	require.Len(t, li2, 2)
 }
 
 func TestInternalCacheWrites(t *testing.T) {
 	id := "ticw"
-	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, false, true, nil, map[string]string{"cache-writes": "true"})
+	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, false, true, nil, map[string]string{"writes": "true"})
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
 	cfs, err := runInstance.getCacheFs(rootFs)
@@ -793,7 +783,7 @@ func TestInternalCacheWrites(t *testing.T) {
 
 func TestInternalMaxChunkSizeRespected(t *testing.T) {
 	id := fmt.Sprintf("timcsr%v", time.Now().Unix())
-	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, false, true, nil, map[string]string{"cache-workers": "1"})
+	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, false, true, nil, map[string]string{"workers": "1"})
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
 	cfs, err := runInstance.getCacheFs(rootFs)
@@ -868,7 +858,7 @@ func TestInternalBug2117(t *testing.T) {
 
 	id := fmt.Sprintf("tib2117%v", time.Now().Unix())
 	rootFs, boltDb := runInstance.newCacheFs(t, remoteName, id, false, true, nil,
-		map[string]string{"cache-info-age": "72h", "cache-chunk-clean-interval": "15m"})
+		map[string]string{"info_age": "72h", "chunk_clean_interval": "15m"})
 	defer runInstance.cleanupFs(t, rootFs, boltDb)
 
 	if runInstance.rootIsCrypt {
@@ -918,10 +908,7 @@ func TestInternalBug2117(t *testing.T) {
 // run holds the remotes for a test run
 type run struct {
 	okDiff            time.Duration
-	allCfgMap         map[string]string
-	allFlagMap        map[string]string
-	runDefaultCfgMap  map[string]string
-	runDefaultFlagMap map[string]string
+	runDefaultCfgMap  configmap.Simple
 	mntDir            string
 	tmpUploadDir      string
 	useMount          bool
@@ -945,38 +932,16 @@ func newRun() *run {
 		isMounted: false,
 	}
 
-	r.allCfgMap = map[string]string{
-		"plex_url":         "",
-		"plex_username":    "",
-		"plex_password":    "",
-		"chunk_size":       cache.DefCacheChunkSize,
-		"info_age":         cache.DefCacheInfoAge,
-		"chunk_total_size": cache.DefCacheTotalChunkSize,
+	// Read in all the defaults for all the options
+	fsInfo, err := fs.Find("cache")
+	if err != nil {
+		panic(fmt.Sprintf("Couldn't find cache remote: %v", err))
 	}
-	r.allFlagMap = map[string]string{
-		"cache-db-path":              filepath.Join(config.CacheDir, "cache-backend"),
-		"cache-chunk-path":           filepath.Join(config.CacheDir, "cache-backend"),
-		"cache-db-purge":             "true",
-		"cache-chunk-size":           cache.DefCacheChunkSize,
-		"cache-total-chunk-size":     cache.DefCacheTotalChunkSize,
-		"cache-chunk-clean-interval": cache.DefCacheChunkCleanInterval,
-		"cache-info-age":             cache.DefCacheInfoAge,
-		"cache-read-retries":         strconv.Itoa(cache.DefCacheReadRetries),
-		"cache-workers":              strconv.Itoa(cache.DefCacheTotalWorkers),
-		"cache-chunk-no-memory":      "false",
-		"cache-rps":                  strconv.Itoa(cache.DefCacheRps),
-		"cache-writes":               "false",
-		"cache-tmp-upload-path":      "",
-		"cache-tmp-wait-time":        cache.DefCacheTmpWaitTime,
+	r.runDefaultCfgMap = configmap.Simple{}
+	for _, option := range fsInfo.Options {
+		r.runDefaultCfgMap.Set(option.Name, fmt.Sprint(option.Default))
 	}
-	r.runDefaultCfgMap = make(map[string]string)
-	for key, value := range r.allCfgMap {
-		r.runDefaultCfgMap[key] = value
-	}
-	r.runDefaultFlagMap = make(map[string]string)
-	for key, value := range r.allFlagMap {
-		r.runDefaultFlagMap[key] = value
-	}
+
 	if mountDir == "" {
 		if runtime.GOOS != "windows" {
 			r.mntDir, err = ioutil.TempDir("", "rclonecache-mount")
@@ -1086,28 +1051,22 @@ func (r *run) newCacheFs(t *testing.T, remote, id string, needRemote, purge bool
 	boltDb, err := cache.GetPersistent(runInstance.dbPath, runInstance.chunkPath, &cache.Features{PurgeDb: true})
 	require.NoError(t, err)
 
-	for k, v := range r.runDefaultCfgMap {
-		if c, ok := cfg[k]; ok {
-			config.FileSet(cacheRemote, k, c)
-		} else {
-			config.FileSet(cacheRemote, k, v)
-		}
-	}
-	for k, v := range r.runDefaultFlagMap {
-		if c, ok := flags[k]; ok {
-			_ = flag.Set(k, c)
-		} else {
-			_ = flag.Set(k, v)
-		}
-	}
 	fs.Config.LowLevelRetries = 1
+
+	m := configmap.Simple{}
+	for k, v := range r.runDefaultCfgMap {
+		m.Set(k, v)
+	}
+	for k, v := range flags {
+		m.Set(k, v)
+	}
 
 	// Instantiate root
 	if purge {
 		boltDb.PurgeTempUploads()
 		_ = os.RemoveAll(path.Join(runInstance.tmpUploadDir, id))
 	}
-	f, err := fs.NewFs(remote + ":" + id)
+	f, err := cache.NewFs(remote, id, m)
 	require.NoError(t, err)
 	cfs, err := r.getCacheFs(f)
 	require.NoError(t, err)
@@ -1157,9 +1116,6 @@ func (r *run) cleanupFs(t *testing.T, f fs.Fs, b *cache.Persistent) {
 	}
 	r.tempFiles = nil
 	debug.FreeOSMemory()
-	for k, v := range r.runDefaultFlagMap {
-		_ = flag.Set(k, v)
-	}
 }
 
 func (r *run) randomReader(t *testing.T, size int64) io.ReadCloser {
@@ -1539,7 +1495,8 @@ func (r *run) updateData(t *testing.T, rootFs fs.Fs, src, data, append string) e
 	var err error
 
 	if r.useMount {
-		f, err := os.OpenFile(path.Join(runInstance.mntDir, src), os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+		var f *os.File
+		f, err = os.OpenFile(path.Join(runInstance.mntDir, src), os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			return err
 		}
@@ -1549,7 +1506,8 @@ func (r *run) updateData(t *testing.T, rootFs fs.Fs, src, data, append string) e
 		}()
 		_, err = f.WriteString(data + append)
 	} else {
-		obj1, err := rootFs.NewObject(src)
+		var obj1 fs.Object
+		obj1, err = rootFs.NewObject(src)
 		if err != nil {
 			return err
 		}
@@ -1681,15 +1639,13 @@ func (r *run) getCacheFs(f fs.Fs) (*cache.Fs, error) {
 	cfs, ok := f.(*cache.Fs)
 	if ok {
 		return cfs, nil
-	} else {
-		if f.Features().UnWrap != nil {
-			cfs, ok := f.Features().UnWrap().(*cache.Fs)
-			if ok {
-				return cfs, nil
-			}
+	}
+	if f.Features().UnWrap != nil {
+		cfs, ok := f.Features().UnWrap().(*cache.Fs)
+		if ok {
+			return cfs, nil
 		}
 	}
-
 	return nil, errors.New("didn't found a cache fs")
 }
 

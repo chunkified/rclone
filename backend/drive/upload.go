@@ -50,15 +50,16 @@ type resumableUpload struct {
 }
 
 // Upload the io.Reader in of size bytes with contentType and info
-func (f *Fs) Upload(in io.Reader, size int64, contentType string, fileID string, info *drive.File, remote string) (*drive.File, error) {
-	params := make(url.Values)
-	params.Set("alt", "json")
-	params.Set("uploadType", "resumable")
-	params.Set("fields", partialFields)
+func (f *Fs) Upload(in io.Reader, size int64, contentType, fileID, remote string, info *drive.File) (*drive.File, error) {
+	params := url.Values{
+		"alt":        {"json"},
+		"uploadType": {"resumable"},
+		"fields":     {partialFields},
+	}
 	if f.isTeamDrive {
 		params.Set("supportsTeamDrives", "true")
 	}
-	if *driveKeepRevisionForever {
+	if f.opt.KeepRevisionForever {
 		params.Set("keepRevisionForever", "true")
 	}
 	urls := "https://www.googleapis.com/upload/drive/v3/files"
@@ -182,7 +183,7 @@ func (rx *resumableUpload) transferChunk(start int64, chunk io.ReadSeeker, chunk
 	// been 200 OK.
 	//
 	// So parse the response out of the body.  We aren't expecting
-	// any other 2xx codes, so we parse it unconditionaly on
+	// any other 2xx codes, so we parse it unconditionally on
 	// StatusCode
 	if err = json.NewDecoder(res.Body).Decode(&rx.ret); err != nil {
 		return 598, err
@@ -197,11 +198,11 @@ func (rx *resumableUpload) Upload() (*drive.File, error) {
 	start := int64(0)
 	var StatusCode int
 	var err error
-	buf := make([]byte, int(chunkSize))
+	buf := make([]byte, int(rx.f.opt.ChunkSize))
 	for start < rx.ContentLength {
 		reqSize := rx.ContentLength - start
-		if reqSize >= int64(chunkSize) {
-			reqSize = int64(chunkSize)
+		if reqSize >= int64(rx.f.opt.ChunkSize) {
+			reqSize = int64(rx.f.opt.ChunkSize)
 		}
 		chunk := readers.NewRepeatableLimitReaderBuffer(rx.Media, buf, reqSize)
 

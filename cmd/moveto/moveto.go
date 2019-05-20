@@ -19,7 +19,7 @@ If source:path is a file or directory then it moves it to a file or
 directory named dest:path.
 
 This can be used to rename files or upload single files to other than
-their existing name.  If the source is a directory then it acts exacty
+their existing name.  If the source is a directory then it acts exactly
 like the move command.
 
 So
@@ -43,6 +43,8 @@ transfer.
 
 **Important**: Since this can cause data loss, test first with the
 --dry-run flag.
+
+**Note**: Use the ` + "`-P`" + `/` + "`--progress`" + ` flag to view real-time transfer statistics.
 `,
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(2, 2, command, args)
@@ -50,7 +52,7 @@ transfer.
 
 		cmd.Run(true, true, command, func() error {
 			if srcFileName == "" {
-				return sync.MoveDir(fdst, fsrc, false)
+				return sync.MoveDir(fdst, fsrc, false, false)
 			}
 			return operations.MoveFile(fdst, fsrc, dstFileName, srcFileName)
 		})

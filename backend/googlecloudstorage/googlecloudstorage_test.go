@@ -1,4 +1,5 @@
 // Test GoogleCloudStorage filesystem interface
+
 package googlecloudstorage_test
 
 import (

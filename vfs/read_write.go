@@ -12,6 +12,7 @@ import (
 	"github.com/ncw/rclone/fs/accounting"
 	"github.com/ncw/rclone/fs/log"
 	"github.com/ncw/rclone/fs/operations"
+	"github.com/ncw/rclone/lib/file"
 	"github.com/pkg/errors"
 )
 
@@ -124,7 +125,7 @@ func (fh *RWFileHandle) openPending(truncate bool) (err error) {
 		}
 
 		// try to open a exising cache file
-		fd, err = os.OpenFile(fh.osPath, cacheFileOpenFlags&^os.O_CREATE, 0600)
+		fd, err = file.OpenFile(fh.osPath, cacheFileOpenFlags&^os.O_CREATE, 0600)
 		if os.IsNotExist(err) {
 			// cache file does not exist, so need to fetch it if we have an object to fetch
 			// it from
@@ -185,7 +186,7 @@ func (fh *RWFileHandle) openPending(truncate bool) (err error) {
 
 	if fd == nil {
 		fs.Debugf(fh.logPrefix(), "Opening cached copy with flags=%s", decodeOpenFlags(fh.flags))
-		fd, err = os.OpenFile(fh.osPath, cacheFileOpenFlags, 0600)
+		fd, err = file.OpenFile(fh.osPath, cacheFileOpenFlags, 0600)
 		if err != nil {
 			return errors.Wrap(err, "cache open file failed")
 		}
@@ -261,9 +262,9 @@ func (fh *RWFileHandle) close() (err error) {
 		return nil
 	}
 
-	copy := false
+	isCopied := false
 	if writer {
-		copy = fh.file.delWriter(fh, fh.modified())
+		isCopied = fh.file.delWriter(fh, fh.modified())
 		defer fh.file.finishWriterClose()
 	}
 
@@ -293,7 +294,7 @@ func (fh *RWFileHandle) close() (err error) {
 		}
 	}
 
-	if copy {
+	if isCopied {
 		// Transfer the temp file to the remote
 		cacheObj, err := fh.d.vfs.cache.f.NewObject(fh.remote)
 		if err != nil {

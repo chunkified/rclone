@@ -12,6 +12,7 @@ import (
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/fs/config"
 	"github.com/ncw/rclone/fs/config/flags"
+	"github.com/ncw/rclone/fs/rc"
 	"github.com/spf13/pflag"
 )
 
@@ -26,11 +27,11 @@ var (
 	deleteAfter     bool
 	bindAddr        string
 	disableFeatures string
-	noTraverse      bool
 )
 
 // AddFlags adds the non filing system specific flags to the command
 func AddFlags(flagSet *pflag.FlagSet) {
+	rc.AddOption("main", fs.Config)
 	// NB defaults which aren't the zero for the type should be set in fs/config.go NewConfig
 	flags.CountVarP(flagSet, &verbose, "verbose", "v", "Print lots more stuff (repeat for more)")
 	flags.BoolVarP(flagSet, &quiet, "quiet", "q", false, "Print as little stuff as possible")
@@ -39,7 +40,7 @@ func AddFlags(flagSet *pflag.FlagSet) {
 	flags.IntVarP(flagSet, &fs.Config.Transfers, "transfers", "", fs.Config.Transfers, "Number of file transfers to run in parallel.")
 	flags.StringVarP(flagSet, &config.ConfigPath, "config", "", config.ConfigPath, "Config file.")
 	flags.StringVarP(flagSet, &config.CacheDir, "cache-dir", "", config.CacheDir, "Directory rclone will use for caching.")
-	flags.BoolVarP(flagSet, &fs.Config.CheckSum, "checksum", "c", fs.Config.CheckSum, "Skip based on checksum & size, not mod-time & size")
+	flags.BoolVarP(flagSet, &fs.Config.CheckSum, "checksum", "c", fs.Config.CheckSum, "Skip based on checksum (if available) & size, not mod-time & size")
 	flags.BoolVarP(flagSet, &fs.Config.SizeOnly, "size-only", "", fs.Config.SizeOnly, "Skip based on size only, not mod-time or checksum")
 	flags.BoolVarP(flagSet, &fs.Config.IgnoreTimes, "ignore-times", "I", fs.Config.IgnoreTimes, "Don't skip files that match size and time - transfer all files")
 	flags.BoolVarP(flagSet, &fs.Config.IgnoreExisting, "ignore-existing", "", fs.Config.IgnoreExisting, "Skip all files that exist on destination")
@@ -47,13 +48,13 @@ func AddFlags(flagSet *pflag.FlagSet) {
 	flags.BoolVarP(flagSet, &fs.Config.DryRun, "dry-run", "n", fs.Config.DryRun, "Do a trial run with no permanent changes")
 	flags.DurationVarP(flagSet, &fs.Config.ConnectTimeout, "contimeout", "", fs.Config.ConnectTimeout, "Connect timeout")
 	flags.DurationVarP(flagSet, &fs.Config.Timeout, "timeout", "", fs.Config.Timeout, "IO idle timeout")
-	flags.BoolVarP(flagSet, &dumpHeaders, "dump-headers", "", false, "Dump HTTP bodies - may contain sensitive info")
+	flags.BoolVarP(flagSet, &dumpHeaders, "dump-headers", "", false, "Dump HTTP headers - may contain sensitive info")
 	flags.BoolVarP(flagSet, &dumpBodies, "dump-bodies", "", false, "Dump HTTP headers and bodies - may contain sensitive info")
 	flags.BoolVarP(flagSet, &fs.Config.InsecureSkipVerify, "no-check-certificate", "", fs.Config.InsecureSkipVerify, "Do not verify the server SSL certificate. Insecure.")
 	flags.BoolVarP(flagSet, &fs.Config.AskPassword, "ask-password", "", fs.Config.AskPassword, "Allow prompt for password for encrypted configuration.")
-	flags.BoolVarP(flagSet, &deleteBefore, "delete-before", "", false, "When synchronizing, delete files on destination before transfering")
-	flags.BoolVarP(flagSet, &deleteDuring, "delete-during", "", false, "When synchronizing, delete files during transfer (default)")
-	flags.BoolVarP(flagSet, &deleteAfter, "delete-after", "", false, "When synchronizing, delete files on destination after transfering")
+	flags.BoolVarP(flagSet, &deleteBefore, "delete-before", "", false, "When synchronizing, delete files on destination before transferring")
+	flags.BoolVarP(flagSet, &deleteDuring, "delete-during", "", false, "When synchronizing, delete files during transfer")
+	flags.BoolVarP(flagSet, &deleteAfter, "delete-after", "", false, "When synchronizing, delete files on destination after transferring (default)")
 	flags.IntVar64P(flagSet, &fs.Config.MaxDelete, "max-delete", "", -1, "When synchronizing, limit the number of deletes")
 	flags.BoolVarP(flagSet, &fs.Config.TrackRenames, "track-renames", "", fs.Config.TrackRenames, "When synchronizing, track file renames and do a server side move if possible")
 	flags.IntVarP(flagSet, &fs.Config.LowLevelRetries, "low-level-retries", "", fs.Config.LowLevelRetries, "Number of low level retries to do.")
@@ -63,10 +64,11 @@ func AddFlags(flagSet *pflag.FlagSet) {
 	flags.IntVarP(flagSet, &fs.Config.MaxDepth, "max-depth", "", fs.Config.MaxDepth, "If set limits the recursion depth to this.")
 	flags.BoolVarP(flagSet, &fs.Config.IgnoreSize, "ignore-size", "", false, "Ignore size when skipping use mod-time or checksum.")
 	flags.BoolVarP(flagSet, &fs.Config.IgnoreChecksum, "ignore-checksum", "", fs.Config.IgnoreChecksum, "Skip post copy check of checksums.")
-	flags.BoolVarP(flagSet, &noTraverse, "no-traverse", "", noTraverse, "Obsolete - does nothing.")
+	flags.BoolVarP(flagSet, &fs.Config.NoTraverse, "no-traverse", "", fs.Config.NoTraverse, "Don't traverse destination file system on copy.")
 	flags.BoolVarP(flagSet, &fs.Config.NoUpdateModTime, "no-update-modtime", "", fs.Config.NoUpdateModTime, "Don't update destination mod-time if files identical.")
 	flags.StringVarP(flagSet, &fs.Config.BackupDir, "backup-dir", "", fs.Config.BackupDir, "Make backups into hierarchy based in DIR.")
 	flags.StringVarP(flagSet, &fs.Config.Suffix, "suffix", "", fs.Config.Suffix, "Suffix for use with --backup-dir.")
+	flags.BoolVarP(flagSet, &fs.Config.SuffixKeepExtension, "suffix-keep-extension", "", fs.Config.SuffixKeepExtension, "Preserve the extension when using --suffix.")
 	flags.BoolVarP(flagSet, &fs.Config.UseListR, "fast-list", "", fs.Config.UseListR, "Use recursive list if available. Uses more memory but fewer transactions.")
 	flags.Float64VarP(flagSet, &fs.Config.TPSLimit, "tpslimit", "", fs.Config.TPSLimit, "Limit HTTP transactions per second to this.")
 	flags.IntVarP(flagSet, &fs.Config.TPSLimitBurst, "tpslimit-burst", "", fs.Config.TPSLimitBurst, "Max burst of transactions for --tpslimit.")
@@ -79,13 +81,25 @@ func AddFlags(flagSet *pflag.FlagSet) {
 	flags.FVarP(flagSet, &fs.Config.LogLevel, "log-level", "", "Log level DEBUG|INFO|NOTICE|ERROR")
 	flags.FVarP(flagSet, &fs.Config.StatsLogLevel, "stats-log-level", "", "Log level to show --stats output DEBUG|INFO|NOTICE|ERROR")
 	flags.FVarP(flagSet, &fs.Config.BwLimit, "bwlimit", "", "Bandwidth limit in kBytes/s, or use suffix b|k|M|G or a full timetable.")
-	flags.FVarP(flagSet, &fs.Config.BufferSize, "buffer-size", "", "Buffer size when copying files.")
+	flags.FVarP(flagSet, &fs.Config.BufferSize, "buffer-size", "", "In memory buffer size when reading files for each --transfer.")
 	flags.FVarP(flagSet, &fs.Config.StreamingUploadCutoff, "streaming-upload-cutoff", "", "Cutoff for switching to chunked upload if file size is unknown. Upload starts after reaching cutoff or when file ends.")
 	flags.FVarP(flagSet, &fs.Config.Dump, "dump", "", "List of items to dump from: "+fs.DumpFlagsList)
 	flags.FVarP(flagSet, &fs.Config.MaxTransfer, "max-transfer", "", "Maximum size of data to transfer.")
+	flags.IntVarP(flagSet, &fs.Config.MaxBacklog, "max-backlog", "", fs.Config.MaxBacklog, "Maximum number of objects in sync or check backlog.")
+	flags.BoolVarP(flagSet, &fs.Config.StatsOneLine, "stats-one-line", "", fs.Config.StatsOneLine, "Make the stats fit on one line.")
+	flags.BoolVarP(flagSet, &fs.Config.StatsOneLineDate, "stats-one-line-date", "", fs.Config.StatsOneLineDate, "Enables --stats-one-line and add current date/time prefix.")
+	flags.StringVarP(flagSet, &fs.Config.StatsOneLineDateFormat, "stats-one-line-date-format", "", fs.Config.StatsOneLineDateFormat, "Enables --stats-one-line-date and uses custom formatted date. Enclose date string in double quotes (\"). See https://golang.org/pkg/time/#Time.Format")
+	flags.BoolVarP(flagSet, &fs.Config.Progress, "progress", "P", fs.Config.Progress, "Show progress during transfer.")
+	flags.BoolVarP(flagSet, &fs.Config.Cookie, "use-cookies", "", fs.Config.Cookie, "Enable session cookiejar.")
+	flags.BoolVarP(flagSet, &fs.Config.UseMmap, "use-mmap", "", fs.Config.UseMmap, "Use mmap allocator (see docs).")
+	flags.StringVarP(flagSet, &fs.Config.CaCert, "ca-cert", "", fs.Config.CaCert, "CA certificate used to verify servers")
+	flags.StringVarP(flagSet, &fs.Config.ClientCert, "client-cert", "", fs.Config.ClientCert, "Client SSL certificate (PEM) for mutual TLS auth")
+	flags.StringVarP(flagSet, &fs.Config.ClientKey, "client-key", "", fs.Config.ClientKey, "Client SSL private key (PEM) for mutual TLS auth")
+	flags.FVarP(flagSet, &fs.Config.MultiThreadCutoff, "multi-thread-cutoff", "", "Use multi-thread downloads for files above this size.")
+	flags.IntVarP(flagSet, &fs.Config.MultiThreadStreams, "multi-thread-streams", "", fs.Config.MultiThreadStreams, "Max number of streams to use for multi-thread downloads.")
 }
 
-// SetFlags converts any flags into config which weren't straight foward
+// SetFlags converts any flags into config which weren't straight forward
 func SetFlags() {
 	if verbose >= 2 {
 		fs.Config.LogLevel = fs.LogLevelDebug
@@ -106,10 +120,6 @@ func SetFlags() {
 		if quiet {
 			log.Fatalf("Can't set -q and --log-level")
 		}
-	}
-
-	if noTraverse {
-		fs.Logf(nil, "--no-traverse is obsolete and no longer needed - please remove")
 	}
 
 	if dumpHeaders {
@@ -141,6 +151,15 @@ func SetFlags() {
 
 	if fs.Config.Suffix != "" && fs.Config.BackupDir == "" {
 		log.Fatalf(`Can only use --suffix with --backup-dir.`)
+	}
+
+	switch {
+	case len(fs.Config.StatsOneLineDateFormat) > 0:
+		fs.Config.StatsOneLineDate = true
+		fs.Config.StatsOneLine = true
+	case fs.Config.StatsOneLineDate:
+		fs.Config.StatsOneLineDateFormat = "2006/01/02 15:04:05 - "
+		fs.Config.StatsOneLine = true
 	}
 
 	if bindAddr != "" {

@@ -6,14 +6,15 @@ package ncdu
 
 import (
 	"fmt"
-	"log"
 	"path"
 	"sort"
 	"strings"
 
+	runewidth "github.com/mattn/go-runewidth"
 	"github.com/ncw/rclone/cmd"
 	"github.com/ncw/rclone/cmd/ncdu/scan"
 	"github.com/ncw/rclone/fs"
+	"github.com/ncw/rclone/fs/operations"
 	termbox "github.com/nsf/termbox-go"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -43,8 +44,11 @@ Here are the keys - press '?' to toggle the help on and off
     ` + strings.Join(helpText[1:], "\n    ") + `
 
 This an homage to the [ncdu tool](https://dev.yorhel.nl/ncdu) but for
-rclone remotes.  It is missing lots of features at the moment, most
-importantly deleting files, but is useful as it stands.
+rclone remotes.  It is missing lots of features at the moment
+but is useful as it stands.
+
+Note that it might take some time to delete big files/folders. The
+UI won't respond in the meantime since the deletion is done synchronously.
 `,
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(1, 1, command, args)
@@ -64,6 +68,7 @@ var helpText = []string{
 	" c toggle counts",
 	" g toggle graph",
 	" n,s,C sort by name,size,count",
+	" d delete file/directory",
 	" ^L refresh screen",
 	" ? to toggle help on and off",
 	" q/ESC/c-C to quit",
@@ -71,24 +76,27 @@ var helpText = []string{
 
 // UI contains the state of the user interface
 type UI struct {
-	f             fs.Fs         // fs being displayed
-	fsName        string        // human name of Fs
-	root          *scan.Dir     // root directory
-	d             *scan.Dir     // current directory being displayed
-	path          string        // path of current directory
-	showBox       bool          // whether to show a box
-	boxText       []string      // text to show in box
-	entries       fs.DirEntries // entries of current directory
-	sortPerm      []int         // order to display entries in after sorting
-	invSortPerm   []int         // inverse order
-	dirListHeight int           // height of listing
-	listing       bool          // whether listing is in progress
-	showGraph     bool          // toggle showing graph
-	showCounts    bool          // toggle showing counts
-	sortByName    int8          // +1 for normal, 0 for off, -1 for reverse
-	sortBySize    int8
-	sortByCount   int8
-	dirPosMap     map[string]dirPos // store for directory positions
+	f              fs.Fs     // fs being displayed
+	fsName         string    // human name of Fs
+	root           *scan.Dir // root directory
+	d              *scan.Dir // current directory being displayed
+	path           string    // path of current directory
+	showBox        bool      // whether to show a box
+	boxText        []string  // text to show in box
+	boxMenu        []string  // box menu options
+	boxMenuButton  int
+	boxMenuHandler func(fs fs.Fs, path string, option int) (string, error)
+	entries        fs.DirEntries // entries of current directory
+	sortPerm       []int         // order to display entries in after sorting
+	invSortPerm    []int         // inverse order
+	dirListHeight  int           // height of listing
+	listing        bool          // whether listing is in progress
+	showGraph      bool          // toggle showing graph
+	showCounts     bool          // toggle showing counts
+	sortByName     int8          // +1 for normal, 0 for off, -1 for reverse
+	sortBySize     int8
+	sortByCount    int8
+	dirPosMap      map[string]dirPos // store for directory positions
 }
 
 // Where we have got to in the directory listing
@@ -115,7 +123,7 @@ func Printf(x, y int, fg, bg termbox.Attribute, format string, args ...interface
 func Line(x, y, xmax int, fg, bg termbox.Attribute, spacer rune, msg string) {
 	for _, c := range msg {
 		termbox.SetCell(x, y, c, fg, bg)
-		x++
+		x += runewidth.RuneWidth(c)
 		if x >= xmax {
 			return
 		}
@@ -129,6 +137,54 @@ func Line(x, y, xmax int, fg, bg termbox.Attribute, spacer rune, msg string) {
 func Linef(x, y, xmax int, fg, bg termbox.Attribute, spacer rune, format string, args ...interface{}) {
 	s := fmt.Sprintf(format, args...)
 	Line(x, y, xmax, fg, bg, spacer, s)
+}
+
+// LineOptions Print line of selectable options
+func LineOptions(x, y, xmax int, fg, bg termbox.Attribute, options []string, selected int) {
+	defaultBg := bg
+	defaultFg := fg
+
+	// Print left+right whitespace to center the options
+	xoffset := ((xmax - x) - lineOptionLength(options)) / 2
+	for j := x; j < x+xoffset; j++ {
+		termbox.SetCell(j, y, ' ', fg, bg)
+	}
+	for j := xmax - xoffset; j < xmax; j++ {
+		termbox.SetCell(j, y, ' ', fg, bg)
+	}
+	x += xoffset
+
+	for i, o := range options {
+		termbox.SetCell(x, y, ' ', fg, bg)
+
+		if i == selected {
+			bg = termbox.ColorBlack
+			fg = termbox.ColorWhite
+		}
+		termbox.SetCell(x+1, y, '<', fg, bg)
+		x += 2
+
+		// print option text
+		for _, c := range o {
+			termbox.SetCell(x, y, c, fg, bg)
+			x++
+		}
+
+		termbox.SetCell(x, y, '>', fg, bg)
+		bg = defaultBg
+		fg = defaultFg
+
+		termbox.SetCell(x+1, y, ' ', fg, bg)
+		x += 2
+	}
+}
+
+func lineOptionLength(o []string) int {
+	count := 0
+	for _, i := range o {
+		count += len(i)
+	}
+	return count + 4*len(o) // spacer and arrows <entry>
 }
 
 // Box the u.boxText onto the screen
@@ -148,6 +204,15 @@ func (u *UI) Box() {
 	x := (w - boxWidth) / 2
 	y := (h - boxHeight) / 2
 	xmax := x + boxWidth
+	if len(u.boxMenu) != 0 {
+		count := lineOptionLength(u.boxMenu)
+		if x+boxWidth > x+count {
+			xmax = x + boxWidth
+		} else {
+			xmax = x + count
+		}
+	}
+	ymax := y + len(u.boxText)
 
 	// draw text
 	fg, bg := termbox.ColorRed, termbox.ColorWhite
@@ -156,7 +221,43 @@ func (u *UI) Box() {
 		fg = termbox.ColorBlack
 	}
 
-	// FIXME draw a box around
+	if len(u.boxMenu) != 0 {
+		ymax++
+		LineOptions(x, ymax-1, xmax, fg, bg, u.boxMenu, u.boxMenuButton)
+	}
+
+	// draw top border
+	for i := y; i < ymax; i++ {
+		termbox.SetCell(x-1, i, '│', fg, bg)
+		termbox.SetCell(xmax, i, '│', fg, bg)
+	}
+	for j := x; j < xmax; j++ {
+		termbox.SetCell(j, y-1, '─', fg, bg)
+		termbox.SetCell(j, ymax, '─', fg, bg)
+	}
+
+	termbox.SetCell(x-1, y-1, '┌', fg, bg)
+	termbox.SetCell(xmax, y-1, '┐', fg, bg)
+	termbox.SetCell(x-1, ymax, '└', fg, bg)
+	termbox.SetCell(xmax, ymax, '┘', fg, bg)
+}
+
+func (u *UI) moveBox(to int) {
+	if len(u.boxMenu) == 0 {
+		return
+	}
+
+	if to > 0 { // move right
+		u.boxMenuButton++
+	} else { // move left
+		u.boxMenuButton--
+	}
+
+	if u.boxMenuButton >= len(u.boxMenu) {
+		u.boxMenuButton = len(u.boxMenu) - 1
+	} else if u.boxMenuButton < 0 {
+		u.boxMenuButton = 0
+	}
 }
 
 // find the biggest entry in the current listing
@@ -260,7 +361,7 @@ func (u *UI) Draw() error {
 		Linef(0, h-1, w, termbox.ColorBlack, termbox.ColorWhite, ' ', "Total usage: %v, Objects: %d%s", fs.SizeSuffix(size), count, message)
 	}
 
-	// Show the box on top if requred
+	// Show the box on top if required
 	if u.showBox {
 		u.Box()
 	}
@@ -313,6 +414,50 @@ func (u *UI) move(d int) {
 
 	// write dirPos back for later
 	u.dirPosMap[u.path] = dirPos
+}
+
+func (u *UI) removeEntry(pos int) {
+	u.d.Remove(pos)
+	u.setCurrentDir(u.d)
+}
+
+// delete the entry at the current position
+func (u *UI) delete() {
+	dirPos := u.sortPerm[u.dirPosMap[u.path].entry]
+	entry := u.entries[dirPos]
+	u.boxMenu = []string{"cancel", "confirm"}
+	if obj, isFile := entry.(fs.Object); isFile {
+		u.boxMenuHandler = func(f fs.Fs, p string, o int) (string, error) {
+			if o != 1 {
+				return "Aborted!", nil
+			}
+			err := operations.DeleteFile(obj)
+			if err != nil {
+				return "", err
+			}
+			u.removeEntry(dirPos)
+			return "Successfully deleted file!", nil
+		}
+		u.popupBox([]string{
+			"Delete this file?",
+			u.fsName + entry.String()})
+	} else {
+		u.boxMenuHandler = func(f fs.Fs, p string, o int) (string, error) {
+			if o != 1 {
+				return "Aborted!", nil
+			}
+			err := operations.Purge(f, entry.String())
+			if err != nil {
+				return "", err
+			}
+			u.removeEntry(dirPos)
+			return "Successfully purged folder!", nil
+		}
+		u.popupBox([]string{
+			"Purge this directory?",
+			"ALL files in it will be deleted",
+			u.fsName + entry.String()})
+	}
 }
 
 // Sort by the configured sort method
@@ -406,6 +551,25 @@ func (u *UI) enter() {
 	u.setCurrentDir(d)
 }
 
+// handles a box option that was selected
+func (u *UI) handleBoxOption() {
+	msg, err := u.boxMenuHandler(u.f, u.path, u.boxMenuButton)
+	// reset
+	u.boxMenuButton = 0
+	u.boxMenu = []string{}
+	u.boxMenuHandler = nil
+	if err != nil {
+		u.popupBox([]string{
+			"error:",
+			err.Error(),
+		})
+		return
+	}
+
+	u.popupBox([]string{"Finished:", msg})
+
+}
+
 // up goes up to the parent directory
 func (u *UI) up() {
 	if u.d == nil {
@@ -466,7 +630,7 @@ func NewUI(f fs.Fs) *UI {
 func (u *UI) Show() error {
 	err := termbox.Init()
 	if err != nil {
-		log.Fatal(err)
+		return errors.Wrap(err, "termbox init")
 	}
 	defer termbox.Close()
 
@@ -525,8 +689,22 @@ outer:
 				case termbox.KeyPgup, '=', '+':
 					u.move(-u.dirListHeight)
 				case termbox.KeyArrowLeft, 'h':
+					if u.showBox {
+						u.moveBox(-1)
+						break
+					}
 					u.up()
-				case termbox.KeyArrowRight, 'l', termbox.KeyEnter:
+				case termbox.KeyEnter:
+					if len(u.boxMenu) > 0 {
+						u.handleBoxOption()
+						break
+					}
+					u.enter()
+				case termbox.KeyArrowRight, 'l':
+					if u.showBox {
+						u.moveBox(1)
+						break
+					}
 					u.enter()
 				case 'c':
 					u.showCounts = !u.showCounts
@@ -538,6 +716,8 @@ outer:
 					u.toggleSort(&u.sortBySize)
 				case 'C':
 					u.toggleSort(&u.sortByCount)
+				case 'd':
+					u.delete()
 				case '?':
 					u.togglePopupBox(helpText)
 

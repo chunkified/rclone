@@ -6,19 +6,22 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/fs/config"
+	"github.com/ncw/rclone/fs/config/configmap"
+	"github.com/ncw/rclone/fs/config/configstruct"
 	"github.com/ncw/rclone/fs/config/obscure"
 	"github.com/ncw/rclone/fs/fserrors"
 	"github.com/ncw/rclone/fs/fshttp"
 	"github.com/ncw/rclone/fs/hash"
 	"github.com/ncw/rclone/lib/dircache"
 	"github.com/ncw/rclone/lib/pacer"
+	"github.com/ncw/rclone/lib/readers"
 	"github.com/ncw/rclone/lib/rest"
 	"github.com/pkg/errors"
 )
@@ -37,25 +40,32 @@ func init() {
 		Description: "OpenDrive",
 		NewFs:       NewFs,
 		Options: []fs.Option{{
-			Name: "username",
-			Help: "Username",
+			Name:     "username",
+			Help:     "Username",
+			Required: true,
 		}, {
 			Name:       "password",
 			Help:       "Password.",
 			IsPassword: true,
+			Required:   true,
 		}},
 	})
+}
+
+// Options defines the configuration for this backend
+type Options struct {
+	UserName string `config:"username"`
+	Password string `config:"password"`
 }
 
 // Fs represents a remote server
 type Fs struct {
 	name     string             // name of this remote
 	root     string             // the path we are working on
+	opt      Options            // parsed options
 	features *fs.Features       // optional features
-	username string             // account name
-	password string             // auth key0
 	srv      *rest.Client       // the connection to the server
-	pacer    *pacer.Pacer       // To pace and retry the API calls
+	pacer    *fs.Pacer          // To pace and retry the API calls
 	session  UserSessionInfo    // contains the session data
 	dirCache *dircache.DirCache // Map of directory path to directory id
 }
@@ -109,28 +119,32 @@ func (f *Fs) DirCacheFlush() {
 	f.dirCache.ResetRoot()
 }
 
-// NewFs contstructs an Fs from the path, bucket:path
-func NewFs(name, root string) (fs.Fs, error) {
+// NewFs constructs an Fs from the path, bucket:path
+func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
+	// Parse config into Options struct
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
+	}
 	root = parsePath(root)
-	username := config.FileGet(name, "username")
-	if username == "" {
+	if opt.UserName == "" {
 		return nil, errors.New("username not found")
 	}
-	password, err := obscure.Reveal(config.FileGet(name, "password"))
+	opt.Password, err = obscure.Reveal(opt.Password)
 	if err != nil {
-		return nil, errors.New("password coudl not revealed")
+		return nil, errors.New("password could not revealed")
 	}
-	if password == "" {
+	if opt.Password == "" {
 		return nil, errors.New("password not found")
 	}
 
 	f := &Fs{
-		name:     name,
-		username: username,
-		password: password,
-		root:     root,
-		srv:      rest.NewClient(fshttp.NewClient(fs.Config)).SetErrorHandler(errorHandler),
-		pacer:    pacer.New().SetMinSleep(minSleep).SetMaxSleep(maxSleep).SetDecayConstant(decayConstant),
+		name:  name,
+		root:  root,
+		opt:   *opt,
+		srv:   rest.NewClient(fshttp.NewClient(fs.Config)).SetErrorHandler(errorHandler),
+		pacer: fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 
 	f.dirCache = dircache.New(root, "0", f)
@@ -141,7 +155,7 @@ func NewFs(name, root string) (fs.Fs, error) {
 	// get sessionID
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
-		account := Account{Username: username, Password: password}
+		account := Account{Username: opt.UserName, Password: opt.Password}
 
 		opts := rest.Opts{
 			Method: "POST",
@@ -165,17 +179,17 @@ func NewFs(name, root string) (fs.Fs, error) {
 	if err != nil {
 		// Assume it is a file
 		newRoot, remote := dircache.SplitPath(root)
-		newF := *f
-		newF.dirCache = dircache.New(newRoot, "0", &newF)
-		newF.root = newRoot
+		tempF := *f
+		tempF.dirCache = dircache.New(newRoot, "0", &tempF)
+		tempF.root = newRoot
 
 		// Make new Fs which is the parent
-		err = newF.dirCache.FindRoot(false)
+		err = tempF.dirCache.FindRoot(false)
 		if err != nil {
 			// No root so return old f
 			return f, nil
 		}
-		_, err := newF.newObjectWithInfo(remote, nil)
+		_, err := tempF.newObjectWithInfo(remote, nil)
 		if err != nil {
 			if err == fs.ErrorObjectNotFound {
 				// File doesn't exist so return old f
@@ -183,8 +197,13 @@ func NewFs(name, root string) (fs.Fs, error) {
 			}
 			return nil, err
 		}
+		// XXX: update the old f here instead of returning tempF, since
+		// `features` were already filled with functions having *f as a receiver.
+		// See https://github.com/ncw/rclone/issues/2182
+		f.dirCache = tempF.dirCache
+		f.root = tempF.root
 		// return an error with an fs which points to the parent
-		return &newF, fs.ErrorIsFile
+		return f, fs.ErrorIsFile
 	}
 	return f, nil
 }
@@ -268,9 +287,6 @@ func (f *Fs) purgeCheck(dir string, check bool) error {
 		return err
 	}
 	f.dirCache.FlushDir(dir)
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -766,7 +782,7 @@ func (f *Fs) List(dir string) (entries fs.DirEntries, err error) {
 		remote := path.Join(dir, folder.Name)
 		// cache the directory ID for later lookups
 		f.dirCache.Put(remote, folder.FolderID)
-		d := fs.NewDir(remote, time.Unix(int64(folder.DateModified), 0)).SetID(folder.FolderID)
+		d := fs.NewDir(remote, time.Unix(folder.DateModified, 0)).SetID(folder.FolderID)
 		d.SetItems(int64(folder.ChildFolders))
 		entries = append(entries, d)
 	}
@@ -913,8 +929,9 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 	// resp.Body.Close()
 	// fs.Debugf(nil, "PostOpen: %#v", openResponse)
 
-	// 1 MB chunks size
+	// 10 MB chunks size
 	chunkSize := int64(1024 * 1024 * 10)
+	buf := make([]byte, int(chunkSize))
 	chunkOffset := int64(0)
 	remainingBytes := size
 	chunkCounter := 0
@@ -927,14 +944,19 @@ func (o *Object) Update(in io.Reader, src fs.ObjectInfo, options ...fs.OpenOptio
 		remainingBytes -= currentChunkSize
 		fs.Debugf(o, "Uploading chunk %d, size=%d, remain=%d", chunkCounter, currentChunkSize, remainingBytes)
 
+		chunk := readers.NewRepeatableLimitReaderBuffer(in, buf, currentChunkSize)
 		err = o.fs.pacer.Call(func() (bool, error) {
+			// seek to the start in case this is a retry
+			if _, err = chunk.Seek(0, io.SeekStart); err != nil {
+				return false, err
+			}
 			var formBody bytes.Buffer
 			w := multipart.NewWriter(&formBody)
 			fw, err := w.CreateFormFile("file_data", o.remote)
 			if err != nil {
 				return false, err
 			}
-			if _, err = io.CopyN(fw, in, currentChunkSize); err != nil {
+			if _, err = io.Copy(fw, chunk); err != nil {
 				return false, err
 			}
 			// Add session_id
@@ -1065,7 +1087,7 @@ func (o *Object) readMetaData() (err error) {
 	err = o.fs.pacer.Call(func() (bool, error) {
 		opts := rest.Opts{
 			Method: "GET",
-			Path:   "/folder/itembyname.json/" + o.fs.session.SessionID + "/" + directoryID + "?name=" + rest.URLPathEscape(replaceReservedChars(leaf)),
+			Path:   "/folder/itembyname.json/" + o.fs.session.SessionID + "/" + directoryID + "?name=" + url.QueryEscape(replaceReservedChars(leaf)),
 		}
 		resp, err = o.fs.srv.CallJSON(&opts, nil, &folderList)
 		return o.fs.shouldRetry(resp, err)
